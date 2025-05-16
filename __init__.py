@@ -281,6 +281,50 @@ NODE_CLASS_MAPPINGS = {
     "Sigmas PersistentHomology"           : sigmas.sigmas_persistent_homology,
     "Sigmas NormalizingFlows"             : sigmas.sigmas_normalizing_flows,
 
+    # New Advanced Flow-Based Sigma Nodes
+    "Sigmas CNF Flow"                     : sigmas.sigmas_cnf_flow,
+    "Sigmas Trajectory Flow"              : sigmas.sigmas_trajectory_flow,
+    "Sigmas Rectified Flow"               : sigmas.sigmas_rectified_flow,
+    "Sigmas Stochastic Flow"              : sigmas.sigmas_stochastic_flow,
+    "Sigmas Wavelet Flow"                 : sigmas.sigmas_wavelet_flow,
+    "Sigmas Momentum Flow"                : sigmas.sigmas_momentum_flow,
+    "Sigmas Flow Matching"                : sigmas.sigmas_flow_matching,
+    "Sigmas KL Optimal"                   : sigmas.sigmas_kl_optimal,
+    
+    # Adaptive and Dynamic Schedulers
+    "Sigmas Variance Guided"              : sigmas.sigmas_variance_guided,
+    "Sigmas Error Feedback"               : sigmas.sigmas_error_feedback,
+    "Sigmas Perceptual Loss"              : sigmas.sigmas_perceptual_loss,
+    
+    # Physics-Inspired Schedulers
+    "Sigmas Symplectic Integrator"        : sigmas.sigmas_symplectic_integrator,
+    "Sigmas Accelerated Gradient"         : sigmas.sigmas_accelerated_gradient,
+    "Sigmas Phase Space"                  : sigmas.sigmas_phase_space,
+    
+    # Information-Theoretic Schedulers
+    "Sigmas Reverse KL"                   : sigmas.sigmas_reverse_kl,
+    "Sigmas Mutual Information"           : sigmas.sigmas_mutual_information,
+    "Sigmas Cross Entropy"                : sigmas.sigmas_cross_entropy,
+    
+    # Geometric and Topological Approaches
+    "Sigmas Manifold Preserving"          : sigmas.sigmas_manifold_preserving,
+    "Sigmas Curvature Geodesic"           : sigmas.sigmas_curvature_geodesic,
+    
+    # Hybrid and Composite Methods
+    "Sigmas Multi Resolution"             : sigmas.sigmas_multi_resolution,
+    "Sigmas SDE ODE Hybrid"               : sigmas.sigmas_sde_ode_hybrid,
+    "Sigmas Progressive Distillation"     : sigmas.sigmas_progressive_distillation,
+    
+    # Quantum and Wave-Inspired Approaches
+    "Sigmas Schrodinger Bridge"           : sigmas.sigmas_schrodinger_bridge,
+    "Sigmas Wave Packet"                  : sigmas.sigmas_wave_packet,
+    "Sigmas Quantum Annealing"            : sigmas.sigmas_quantum_annealing,
+    
+    # Neural and Adaptive Methods
+    "Sigmas Learned Path"                 : sigmas.sigmas_learned_path,
+    "Sigmas Transformer Guided"           : sigmas.sigmas_transformer_guided,
+    "Sigmas Meta Learned"                 : sigmas.sigmas_meta_learned,
+
     "ClownScheduler"                      : sigmas.ClownScheduler, # for modulating parameters
     "Tan Scheduler"                       : sigmas.tan_scheduler,
     "Tan Scheduler 2"                     : sigmas.tan_scheduler_2stage,

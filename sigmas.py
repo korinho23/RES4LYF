@@ -3960,3 +3960,2758 @@ class sigmas_normalizing_flows:
             result = (result - result[0]) / (result[-1] - result[0]) * (end_value - start_value) + start_value
         
         return (result,)
+
+
+class sigmas_cnf_flow:
+    def __init__(self):
+        pass
+    
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "sigmas": ("SIGMAS", {"forceInput": True}),
+                "flow_steps": ("INT", {"default": 20, "min": 5, "max": 100, "step": 1}),
+                "flow_type": (["hutchinson", "dopri5", "euler"], {"default": "euler"}),
+                "drift_scale": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 10.0, "step": 0.1}),
+                "diffusion_scale": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 5.0, "step": 0.1}),
+                "regularization": ("FLOAT", {"default": 0.01, "min": 0.0, "max": 1.0, "step": 0.01})
+            }
+        }
+
+    FUNCTION = "main"
+    RETURN_TYPES = ("SIGMAS",)
+    CATEGORY = "RES4LYF/sigmas"
+    
+    def main(self, sigmas, flow_steps, flow_type, drift_scale, diffusion_scale, regularization):
+        # Drift function (simple example)
+        def drift_fn(t, sigma_t):
+            drift = -sigma_t
+            # Add regularization (smoothing)
+            if regularization > 0:
+                drift_smooth = torch.nn.functional.pad(drift.unsqueeze(0).unsqueeze(0), (1, 1), mode='reflect')
+                drift_smooth = torch.nn.functional.avg_pool1d(drift_smooth, kernel_size=3, stride=1).squeeze()
+                drift = (1 - regularization) * drift + regularization * drift_smooth
+            return drift_scale * drift
+        
+        # Diffusion function
+        def diffusion_fn(t, sigma_t):
+            return diffusion_scale * torch.ones_like(sigma_t)
+        
+        # Initial value
+        sigma_0 = sigmas.clone()
+        
+        # Time steps
+        ts = torch.linspace(0, 1, flow_steps, device=sigma_0.device)
+        dt = 1.0 / (flow_steps - 1)
+        
+        # CNF solver selection
+        if flow_type == "euler":
+            # Simple Euler method
+            sigma_t = sigma_0
+            trajectory = [sigma_t.clone()]
+            
+            for i in range(1, flow_steps):
+                t = ts[i-1]
+                # Drift term
+                dsigma = drift_fn(t, sigma_t) * dt
+                # Diffusion term (only for SDE)
+                if diffusion_scale > 0:
+                    noise = torch.randn_like(sigma_t) * torch.sqrt(torch.tensor(dt, device=sigma_t.device))
+                    dsigma += diffusion_fn(t, sigma_t) * noise
+                
+                sigma_t = sigma_t + dsigma
+                trajectory.append(sigma_t.clone())
+                
+            result = torch.stack(trajectory)
+            
+        elif flow_type == "dopri5":
+            # Dopri5 approximation (5th order Runge-Kutta with adaptive step size)
+            sigma_t = sigma_0
+            trajectory = [sigma_t.clone()]
+            
+            for i in range(1, flow_steps):
+                t = ts[i-1]
+                
+                # Runge-Kutta coefficients
+                k1 = drift_fn(t, sigma_t)
+                k2 = drift_fn(t + 0.2*dt, sigma_t + 0.2*dt*k1)
+                k3 = drift_fn(t + 0.3*dt, sigma_t + 0.3*dt*k1 + 0.9*dt*k2)
+                k4 = drift_fn(t + 0.8*dt, sigma_t + 0.8*dt*k1 + 0.9*dt*k2 + 2.4*dt*k3)
+                k5 = drift_fn(t + 0.8*dt, sigma_t - 0.8*dt*k1 + 1.4*dt*k2 - 0.4*dt*k3 + 1.6*dt*k4)
+                k6 = drift_fn(t + dt, sigma_t + 0.05*dt*k1 + 0.25*dt*k4 + 0.2*dt*k5)
+                
+                # 5th order update
+                sigma_t = sigma_t + dt * (0.0616667*k1 + 0.0*k2 + 0.276*k3 + 0.328333*k4 + 0.2*k5 + 0.133333*k6)
+                
+                # Diffusion term (only for SDE)
+                if diffusion_scale > 0:
+                    noise = torch.randn_like(sigma_t) * torch.sqrt(torch.tensor(dt, device=sigma_t.device))
+                    sigma_t += diffusion_fn(t, sigma_t) * noise
+                
+                trajectory.append(sigma_t.clone())
+            
+            result = torch.stack(trajectory)
+            
+        elif flow_type == "hutchinson":
+            # Hutchinson's stochastic trace estimator
+            sigma_t = sigma_0
+            trajectory = [sigma_t.clone()]
+            
+            for i in range(1, flow_steps):
+                t = ts[i-1]
+                
+                # Forward difference for divergence estimation
+                eps = 1e-5
+                v = torch.randn_like(sigma_t)
+                f_x = drift_fn(t, sigma_t)
+                f_x_eps = drift_fn(t, sigma_t + eps * v)
+                div_estimate = ((f_x_eps - f_x) * v).sum() / eps
+                
+                # Drift with divergence correction
+                dsigma = (drift_fn(t, sigma_t) - 0.5 * diffusion_scale**2 * div_estimate) * dt
+                
+                # Diffusion term
+                if diffusion_scale > 0:
+                    noise = torch.randn_like(sigma_t) * torch.sqrt(torch.tensor(dt, device=sigma_t.device))
+                    dsigma += diffusion_scale * noise
+                
+                sigma_t = sigma_t + dsigma
+                trajectory.append(sigma_t.clone())
+            
+            result = torch.stack(trajectory)
+        
+        # Concatenate and return results
+        return (result,)
+
+
+class sigmas_trajectory_flow:
+    def __init__(self):
+        pass
+    
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "sigmas": ("SIGMAS", {"forceInput": True}),
+                "target_sigmas": ("SIGMAS", {"forceInput": True}),
+                "optimization_steps": ("INT", {"default": 10, "min": 1, "max": 50, "step": 1}),
+                "learning_rate": ("FLOAT", {"default": 0.01, "min": 0.001, "max": 0.1, "step": 0.001}),
+                "regularization": ("FLOAT", {"default": 0.005, "min": 0.0, "max": 0.1, "step": 0.001}),
+                "smoothness": ("FLOAT", {"default": 0.2, "min": 0.0, "max": 1.0, "step": 0.01})
+            }
+        }
+
+    FUNCTION = "main"
+    RETURN_TYPES = ("SIGMAS",)
+    CATEGORY = "RES4LYF/sigmas"
+    
+    def main(self, sigmas, target_sigmas, optimization_steps, learning_rate, regularization, smoothness):
+        with torch.inference_mode(False):
+            # Ensure equal lengths
+            if len(sigmas) != len(target_sigmas):
+                if len(sigmas) > len(target_sigmas):
+                    target_sigmas = torch.nn.functional.interpolate(
+                        target_sigmas.unsqueeze(0).unsqueeze(0), 
+                        size=len(sigmas), 
+                        mode='linear'
+                    ).squeeze(0).squeeze(0)
+                else:
+                    sigmas = torch.nn.functional.interpolate(
+                        sigmas.unsqueeze(0).unsqueeze(0), 
+                        size=len(target_sigmas), 
+                        mode='linear'
+                    ).squeeze(0).squeeze(0)
+            
+            # Create optimizable trajectory
+            trajectory = sigmas.clone().detach().requires_grad_(True)
+            
+            # Optimizer
+            optimizer = torch.optim.Adam([trajectory], lr=learning_rate)
+            
+            # Optimization loop
+            for step in range(optimization_steps):
+                optimizer.zero_grad()
+                
+                # Transport cost (endpoint matching)
+                transport_cost = ((trajectory[0] - sigmas[0])**2 + (trajectory[-1] - target_sigmas[-1])**2)
+                
+                # Path regularization (smoothness)
+                diff = trajectory[1:] - trajectory[:-1]
+                smoothness_cost = smoothness * torch.mean(diff**2)
+                
+                # Kinetic energy (total variation)
+                kinetic_energy = torch.sum(torch.abs(diff))
+                
+                # Total loss
+                loss = transport_cost + smoothness_cost + regularization * kinetic_energy
+                
+                loss.backward()
+                optimizer.step()
+            
+            # Return optimized trajectory
+            return (trajectory.detach(),)
+
+
+
+
+class sigmas_rectified_flow:
+    def __init__(self):
+        pass
+    
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "sigmas": ("SIGMAS", {"forceInput": True}),
+                "rectification_strength": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "probability_flow": ("BOOLEAN", {"default": True}),
+                "time_steps": ("INT", {"default": 20, "min": 5, "max": 100, "step": 1}),
+                "normalize_output": ("BOOLEAN", {"default": True})
+            }
+        }
+
+    FUNCTION = "main"
+    RETURN_TYPES = ("SIGMAS",)
+    CATEGORY = "RES4LYF/sigmas"
+    
+    def main(self, sigmas, rectification_strength, probability_flow, time_steps, normalize_output):
+        # Create time steps
+        t = torch.linspace(0, 1, time_steps, device=sigmas.device)
+        
+        # Interpolate original sigmas to match time_steps
+        original_sigmas = torch.nn.functional.interpolate(
+            sigmas.unsqueeze(0).unsqueeze(0), 
+            size=time_steps, 
+            mode='linear'
+        ).squeeze(0).squeeze(0)
+        
+        # Create rectified path
+        start_point = original_sigmas[0]
+        end_point = original_sigmas[-1]
+        
+        # Straight line path (optimal transport)
+        linear_path = start_point * (1 - t) + end_point * t
+        
+        # Apply rectification
+        if probability_flow:
+            # Probability flow ODE rectification
+            # Calculate drift term
+            drift = torch.zeros_like(original_sigmas)
+            drift[1:-1] = (original_sigmas[2:] - original_sigmas[:-2]) / 2  # Central difference
+            drift[0] = original_sigmas[1] - original_sigmas[0]
+            drift[-1] = original_sigmas[-1] - original_sigmas[-2]
+            
+            # Score function approximation
+            score = -drift / (original_sigmas + 1e-6)
+            
+            # Rectified path
+            rectified_path = torch.zeros_like(original_sigmas)
+            
+            # Solve ODE with improved Euler method
+            dt = 1.0 / (time_steps - 1)
+            x = start_point.clone()
+            rectified_path[0] = x
+            
+            for i in range(1, time_steps):
+                # Interpolate score at current position
+                idx = int(i * (len(score) - 1) / (time_steps - 1))
+                frac = i * (len(score) - 1) / (time_steps - 1) - idx
+                s = (1 - frac) * score[idx] + frac * score[min(idx + 1, len(score) - 1)]
+                
+                # Improved Euler step
+                k1 = -s * x
+                x_mid = x + 0.5 * dt * k1
+                k2 = -s * x_mid
+                x = x + dt * k2
+                
+                rectified_path[i] = x
+        else:
+            # Simple linear interpolation between straight line and original
+            rectified_path = (1 - rectification_strength) * original_sigmas + rectification_strength * linear_path
+        
+        # Normalize output if requested
+        if normalize_output:
+            rectified_path = (rectified_path - rectified_path.min()) / (rectified_path.max() - rectified_path.min())
+            rectified_path = rectified_path * (sigmas.max() - sigmas.min()) + sigmas.min()
+        
+        return (rectified_path,)
+
+
+class sigmas_stochastic_flow:
+    def __init__(self):
+        pass
+    
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "sigmas": ("SIGMAS", {"forceInput": True}),
+                "noise_schedule": (["linear", "cosine", "adaptive", "brownian"], {"default": "cosine"}),
+                "stochasticity": ("FLOAT", {"default": 0.2, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "seed": ("INT", {"default": 42, "min": 0, "max": 999999, "step": 1})
+            }
+        }
+
+    FUNCTION = "main"
+    RETURN_TYPES = ("SIGMAS",)
+    CATEGORY = "RES4LYF/sigmas"
+    
+    def main(self, sigmas, noise_schedule, stochasticity, seed):
+        # Set random seed
+        torch.manual_seed(seed)
+        
+        # Create noise schedule
+        t = torch.linspace(0, 1, len(sigmas), device=sigmas.device)
+        
+        if noise_schedule == "linear":
+            noise_level = stochasticity * t * (1 - t)  # Parabolic profile
+            
+        elif noise_schedule == "cosine":
+            noise_level = stochasticity * 0.5 * (1 - torch.cos(math.pi * t))
+            
+        elif noise_schedule == "adaptive":
+            # More noise in regions of high gradient
+            grad = torch.zeros_like(sigmas)
+            grad[1:-1] = torch.abs(sigmas[2:] - sigmas[:-2]) / 2  # Central difference
+            grad[0] = torch.abs(sigmas[1] - sigmas[0])
+            grad[-1] = torch.abs(sigmas[-1] - sigmas[-2])
+            
+            # Normalize gradient
+            grad = grad / grad.max()
+            
+            # Adaptive noise level
+            noise_level = stochasticity * grad * (1 - t)  # Higher at start, lower at end
+            
+        elif noise_schedule == "brownian":
+            # Brownian bridge setup
+            noise_level = stochasticity * torch.sqrt(t * (1 - t))
+        
+        # Generate noise
+        noise = torch.randn_like(sigmas) * noise_level.view(-1)
+        
+        # Apply noise to create stochastic path
+        result = sigmas + noise
+        
+        # Ensure endpoints match the original
+        result[0] = sigmas[0]
+        result[-1] = sigmas[-1]
+        
+        return (result,)
+
+class sigmas_wavelet_flow:
+    def __init__(self):
+        pass
+    
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "sigmas": ("SIGMAS", {"forceInput": True}),
+                "wavelet_type": (["haar", "simple", "adaptive"], {"default": "adaptive"}),
+                "decomposition_level": ("INT", {"default": 3, "min": 1, "max": 10, "step": 1}),
+                "threshold": ("FLOAT", {"default": 0.1, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "reconstruction_mode": (["soft", "hard", "garrote"], {"default": "soft"})
+            }
+        }
+
+    FUNCTION = "main"
+    RETURN_TYPES = ("SIGMAS",)
+    CATEGORY = "RES4LYF/sigmas"
+    
+    def main(self, sigmas, wavelet_type, decomposition_level, threshold, reconstruction_mode):
+        # Pad input to nearest power of 2 length
+        n = len(sigmas)
+        next_pow2 = 2 ** math.ceil(math.log2(n))
+        padded = torch.nn.functional.pad(sigmas, (0, next_pow2 - n))
+        
+        # Decomposition function
+        def wavelet_decompose(data, level):
+            coeffs = []
+            approx = data.clone()
+            
+            for i in range(level):
+                # Choose wavelet filter
+                if wavelet_type == "haar":
+                    # Haar wavelet
+                    h0 = torch.tensor([0.7071, 0.7071], device=data.device)  # Low-pass
+                    h1 = torch.tensor([0.7071, -0.7071], device=data.device) # High-pass
+                elif wavelet_type == "simple":
+                    # Simple Daubechies-like
+                    h0 = torch.tensor([0.6, 0.4], device=data.device)
+                    h1 = torch.tensor([0.4, -0.6], device=data.device)
+                elif wavelet_type == "adaptive":
+                    # Adaptive filter based on signal properties
+                    local_var = torch.var(approx)
+                    alpha = torch.clamp(0.5 + 0.3 * local_var, 0.5, 0.8)
+                    h0 = torch.tensor([alpha, 1-alpha], device=data.device)
+                    h1 = torch.tensor([1-alpha, -alpha], device=data.device)
+                
+                # Apply filters
+                length = len(approx) // 2
+                new_approx = torch.zeros(length, device=data.device)
+                detail = torch.zeros(length, device=data.device)
+                
+                for j in range(length):
+                    idx = j * 2
+                    new_approx[j] = approx[idx] * h0[0] + approx[idx+1] * h0[1]
+                    detail[j] = approx[idx] * h1[0] + approx[idx+1] * h1[1]
+                
+                coeffs.append(detail)
+                approx = new_approx
+                
+                if len(approx) <= 2:
+                    break
+            
+            coeffs.append(approx)
+            return coeffs
+        
+        # Reconstruction function
+        def wavelet_reconstruct(coeffs, level):
+            approx = coeffs[-1]
+            
+            for i in range(level):
+                detail = coeffs[level-i-1]
+                length = len(approx)
+                
+                # Choose wavelet filter
+                if wavelet_type == "haar":
+                    g0 = torch.tensor([0.7071, 0.7071], device=approx.device)
+                    g1 = torch.tensor([-0.7071, 0.7071], device=approx.device)
+                elif wavelet_type == "simple":
+                    g0 = torch.tensor([0.4, 0.6], device=approx.device)
+                    g1 = torch.tensor([-0.6, 0.4], device=approx.device)
+                elif wavelet_type == "adaptive":
+                    local_var = torch.var(approx)
+                    alpha = torch.clamp(0.5 + 0.3 * local_var, 0.5, 0.8)
+                    g0 = torch.tensor([1-alpha, alpha], device=approx.device)
+                    g1 = torch.tensor([alpha, -1+alpha], device=approx.device)
+                
+                # Reconstruct
+                new_approx = torch.zeros(length*2, device=approx.device)
+                for j in range(length):
+                    idx = j * 2
+                    new_approx[idx] = approx[j] * g0[0] + detail[j] * g1[0]
+                    new_approx[idx+1] = approx[j] * g0[1] + detail[j] * g1[1]
+                
+                approx = new_approx
+            
+            return approx
+        
+        # Apply wavelet decomposition
+        coeffs = wavelet_decompose(padded, decomposition_level)
+        
+        # Thresholding
+        for i in range(len(coeffs)-1):  # Skip approximation coefficients
+            detail = coeffs[i]
+            abs_detail = torch.abs(detail)
+            mask = abs_detail > threshold
+            
+            if reconstruction_mode == "hard":
+                # Hard thresholding - keep or zero
+                detail = detail * mask
+            elif reconstruction_mode == "soft":
+                # Soft thresholding - shrink toward zero
+                detail = torch.sign(detail) * torch.max(abs_detail - threshold, torch.zeros_like(detail)) * mask
+            elif reconstruction_mode == "garrote":
+                # Non-negative Garrote
+                detail = detail * torch.max(1 - threshold**2 / (abs_detail**2 + 1e-10), torch.zeros_like(detail)) * mask
+            
+            coeffs[i] = detail
+        
+        # Reconstruct signal
+        reconstructed = wavelet_reconstruct(coeffs, min(decomposition_level, len(coeffs)-1))
+        
+        # Truncate back to original size
+        result = reconstructed[:n]
+        
+        return (result,)
+
+
+
+class sigmas_momentum_flow:
+    def __init__(self):
+        pass
+    
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "sigmas": ("SIGMAS", {"forceInput": True}),
+                "momentum": ("FLOAT", {"default": 0.9, "min": 0.0, "max": 0.99, "step": 0.01}),
+                "flow_acceleration": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "barrier_strength": ("FLOAT", {"default": 0.1, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "steps": ("INT", {"default": 30, "min": 10, "max": 100, "step": 1})
+            }
+        }
+
+    FUNCTION = "main"
+    RETURN_TYPES = ("SIGMAS",)
+    CATEGORY = "RES4LYF/sigmas"
+    
+    def main(self, sigmas, momentum, flow_acceleration, barrier_strength, steps):
+        # Create a smooth path using physical momentum principles
+        
+        # Initial values
+        start_value = sigmas[0]
+        end_value = sigmas[-1]
+        
+        # Initialize position and velocity
+        position = torch.zeros(steps, device=sigmas.device, dtype=sigmas.dtype)
+        velocity = torch.zeros(steps, device=sigmas.device, dtype=sigmas.dtype)
+        
+        # Set initial position
+        position[0] = start_value
+        
+        # Target direction
+        target_direction = torch.sign(end_value - start_value)
+        target_distance = torch.abs(end_value - start_value)
+        
+        # Time step
+        dt = 1.0 / steps
+        
+        # Simulation parameters
+        mass = 1.0
+        
+        # Run simulation
+        for i in range(1, steps):
+            # Time-varying acceleration (stronger near the start)
+            t = i / steps
+            acceleration_scale = flow_acceleration * (1 - t) + 0.1 * t
+            
+            # Attractive force to end point
+            attractive_force = target_direction * (target_distance / steps) * acceleration_scale
+            
+            # Barrier repulsion (to avoid crossing the end point)
+            distance_to_end = torch.abs(position[i-1] - end_value)
+            repulsive_force = 0
+            
+            if distance_to_end < 0.1 * target_distance:
+                repulsive_force = -target_direction * barrier_strength * (0.1 * target_distance / (distance_to_end + 1e-6))
+            
+            # Total force
+            force = attractive_force + repulsive_force
+            
+            # Acceleration (F = ma)
+            acceleration = force / mass
+            
+            # Update velocity with momentum
+            velocity[i] = momentum * velocity[i-1] + (1 - momentum) * acceleration * dt
+            
+            # Update position
+            position[i] = position[i-1] + velocity[i] * dt
+        
+        # Ensure endpoint matches exactly
+        position[-1] = end_value
+        
+        # Optional: Interpolate the results to match the original sigmas profile
+        if len(sigmas) != steps:
+            result = torch.nn.functional.interpolate(
+                position.unsqueeze(0).unsqueeze(0), 
+                size=len(sigmas), 
+                mode='linear'
+            ).squeeze(0).squeeze(0)
+        else:
+            result = position
+            
+        return (result,)
+
+
+class sigmas_flow_matching:
+    def __init__(self):
+        pass
+    
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "sigmas_source": ("SIGMAS", {"forceInput": True}),
+                "sigmas_target": ("SIGMAS", {"forceInput": True}),
+                "interpolation_steps": ("INT", {"default": 20, "min": 5, "max": 100, "step": 1}),
+                "flow_matching_type": (["ode", "sde", "probability_flow", "schrodinger_bridge"], 
+                                     {"default": "probability_flow"}),
+                "regularization": ("FLOAT", {"default": 0.01, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "solver": (["euler", "heun", "rk4", "midpoint"], {"default": "rk4"})
+            }
+        }
+
+    FUNCTION = "main"
+    RETURN_TYPES = ("SIGMAS",)
+    CATEGORY = "RES4LYF/sigmas"
+    
+    def main(self, sigmas_source, sigmas_target, interpolation_steps, flow_matching_type, regularization, solver):
+        # Ensure equal lengths
+        if len(sigmas_source) != len(sigmas_target):
+            if len(sigmas_source) > len(sigmas_target):
+                sigmas_target = torch.nn.functional.interpolate(
+                    sigmas_target.unsqueeze(0).unsqueeze(0), 
+                    size=len(sigmas_source), 
+                    mode='linear'
+                ).squeeze(0).squeeze(0)
+            else:
+                sigmas_source = torch.nn.functional.interpolate(
+                    sigmas_source.unsqueeze(0).unsqueeze(0), 
+                    size=len(sigmas_target), 
+                    mode='linear'
+                ).squeeze(0).squeeze(0)
+        
+        # Create flow vector fields
+        if flow_matching_type == "ode":
+            # ODE flow
+            velocity_field = (sigmas_target - sigmas_source)
+        elif flow_matching_type == "sde":
+            # SDE flow with added noise
+            velocity_field = (sigmas_target - sigmas_source)
+            noise_scale = torch.linspace(0.1, 0.001, len(sigmas_source))
+        elif flow_matching_type == "probability_flow":
+            # Probability flow
+            drift = (sigmas_target - sigmas_source)
+            score = torch.gradient(torch.log(sigmas_source + 1e-6))[0]
+            velocity_field = drift + 0.5 * score
+        elif flow_matching_type == "schrodinger_bridge":
+            # Schrödinger bridge approximation
+            forward_drift = (sigmas_target - sigmas_source)
+            backward_drift = (sigmas_source - sigmas_target)
+            velocity_field = 0.5 * (forward_drift - backward_drift)
+        
+        # Apply regularization
+        if regularization > 0:
+            # Smoothing kernel
+            kernel_size = 5
+            padding = kernel_size // 2
+            kernel = torch.ones(1, 1, kernel_size) / kernel_size
+            velocity_field_padded = torch.nn.functional.pad(velocity_field.unsqueeze(0).unsqueeze(0), 
+                                                          (padding, padding), mode='reflect')
+            velocity_field_smooth = torch.nn.functional.conv1d(velocity_field_padded, kernel).squeeze()
+            velocity_field = (1 - regularization) * velocity_field + regularization * velocity_field_smooth
+        
+        # Select solver and apply
+        t = torch.linspace(0, 1, interpolation_steps)
+        result = torch.zeros(interpolation_steps, device=sigmas_source.device, dtype=sigmas_source.dtype)
+        result[0] = sigmas_source[0]  # Initial value
+        
+        if solver == "euler":
+            # Euler solver
+            dt = 1.0 / (interpolation_steps - 1)
+            current_state = sigmas_source.clone()
+            for i in range(1, interpolation_steps):
+                # Euler step
+                if flow_matching_type == "sde":
+                    # Add random term for SDE
+                    noise = torch.randn_like(current_state) * noise_scale * torch.sqrt(torch.tensor(dt))
+                    current_state = current_state + dt * velocity_field + noise
+                else:
+                    current_state = current_state + dt * velocity_field
+                result[i] = current_state[0]  # Store first element in result
+        
+        elif solver == "rk4":
+            # 4th order Runge-Kutta solver
+            dt = 1.0 / (interpolation_steps - 1)
+            current_state = sigmas_source.clone()
+            
+            for i in range(1, interpolation_steps):
+                # RK4 steps
+                k1 = velocity_field
+                k2 = velocity_field + 0.5 * dt * k1
+                k3 = velocity_field + 0.5 * dt * k2
+                k4 = velocity_field + dt * k3
+                
+                # Update state
+                current_state = current_state + (dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
+                result[i] = current_state[0]
+
+        return (result,)
+
+
+import torch
+import math
+
+class sigmas_variance_guided:
+    def __init__(self):
+        pass
+    
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "steps": ("INT", {"default": 30, "min": 5, "max": 100, "step": 1}),
+                "start_value": ("FLOAT", {"default": 10.0, "min": 0.1, "max": 50.0, "step": 0.1}),
+                "end_value": ("FLOAT", {"default": 0.01, "min": 0.0, "max": 10.0, "step": 0.01}),
+                "variance_sensitivity": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 2.0, "step": 0.01}),
+                "adaptive_range": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "pad_end": ("BOOLEAN", {"default": True}),
+                "normalize_output": ("BOOLEAN", {"default": False})
+            },
+            "optional": {
+                "reference_sigmas": ("SIGMAS", {"forceInput": False})
+            }
+        }
+
+    FUNCTION = "main"
+    RETURN_TYPES = ("SIGMAS",)
+    CATEGORY = "RES4LYF/sigmas"
+    
+    def main(self, steps, start_value, end_value, variance_sensitivity, adaptive_range, pad_end, normalize_output, reference_sigmas=None):
+        device = "cuda"
+        # Initialize base linear schedule
+        t = torch.linspace(0, 1, steps, device=device)
+        base_schedule = start_value * (1 - t) + end_value * t
+        
+        # Add variance-guided adaptivity
+        if reference_sigmas is not None:
+            # Get device from reference sigmas
+            device = reference_sigmas.device
+            
+            # Use reference sigmas for variance analysis
+            ref_sigmas = torch.nn.functional.interpolate(
+                reference_sigmas.unsqueeze(0).unsqueeze(0), 
+                size=steps, 
+                mode='linear'
+            ).squeeze()
+            
+            # Calculate signal variance over windows
+            window_size = max(3, int(steps * 0.1))
+            padding = window_size // 2
+            padded = torch.nn.functional.pad(ref_sigmas.unsqueeze(0).unsqueeze(0), (padding, padding), mode='reflect')
+            
+            # Calculate local variance using conv
+            kernel = torch.ones(1, 1, window_size, device=padded.device) / window_size
+            local_means = torch.nn.functional.conv1d(padded, kernel, padding=0).squeeze()
+            
+            padded_squared = torch.nn.functional.pad(ref_sigmas.unsqueeze(0).unsqueeze(0) ** 2, (padding, padding), mode='reflect')
+            local_means_squared = torch.nn.functional.conv1d(padded_squared, kernel, padding=0).squeeze()
+            
+            local_var = local_means_squared - local_means ** 2
+            local_var = torch.clamp(local_var, min=1e-8)  # Avoid numerical issues
+            
+            # Normalize variance to [0, 1] range
+            if local_var.max() > local_var.min():
+                norm_var = (local_var - local_var.min()) / (local_var.max() - local_var.min()) 
+            else:
+                norm_var = torch.zeros_like(local_var)
+                
+            # Apply variance-guided modification to schedule
+            variance_factor = 1.0 + variance_sensitivity * (norm_var - 0.5) * adaptive_range
+            result = base_schedule * variance_factor
+            
+            # Ensure endpoints remain fixed
+            result[0] = start_value
+            result[-1] = end_value
+        else:
+            # Without reference, create synthetic variance pattern
+            # More variance at early and late stages, less in the middle
+            synthetic_var = 4 * t * (1 - t)  # Parabolic pattern
+            variance_factor = 1.0 + variance_sensitivity * (synthetic_var - 0.5) * adaptive_range
+            result = base_schedule * variance_factor
+            
+            # Ensure endpoints remain fixed
+            result[0] = start_value 
+            result[-1] = end_value
+        
+        # Normalize output if requested
+        if normalize_output:
+            result = (result - result.min()) / (result.max() - result.min()) * (start_value - end_value) + end_value
+            result[0] = start_value
+            result[-1] = end_value
+            
+        # Add padding zero at the end if requested
+        if pad_end:
+            result = torch.cat([result, torch.tensor([0.0], device=result.device, dtype=result.dtype)])
+            
+        return (result,)
+
+
+class sigmas_error_feedback:
+    def __init__(self):
+        pass
+    
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "sigmas": ("SIGMAS", {"forceInput": True}),
+                "feedback_strength": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "error_threshold": ("FLOAT", {"default": 0.1, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "adaptation_steps": ("INT", {"default": 5, "min": 1, "max": 20, "step": 1}),
+                "preserve_total_steps": ("BOOLEAN", {"default": True}),
+                "normalize_output": ("BOOLEAN", {"default": False})
+            }
+        }
+
+    FUNCTION = "main"
+    RETURN_TYPES = ("SIGMAS",)
+    CATEGORY = "RES4LYF/sigmas"
+    
+    def main(self, sigmas, feedback_strength, error_threshold, adaptation_steps, preserve_total_steps, normalize_output):
+        # Copy input sigmas
+        result = sigmas.clone()
+        
+        # Simulate error feedback mechanism
+        for _ in range(adaptation_steps):
+            # Calculate approximated error (normally this would come from actual diffusion steps)
+            # Here we're using a simple heuristic based on sigma values
+            estimated_error = torch.zeros_like(result)
+            
+            # Areas of high gradient in sigma are more error-prone
+            gradient = torch.zeros_like(result)
+            gradient[1:-1] = torch.abs(result[2:] - result[:-2]) / 2  # Central difference
+            gradient[0] = torch.abs(result[1] - result[0])
+            gradient[-1] = torch.abs(result[-1] - result[-2])
+            
+            # Normalize gradient
+            if gradient.max() > gradient.min():
+                norm_gradient = (gradient - gradient.min()) / (gradient.max() - gradient.min())
+                estimated_error = norm_gradient
+            
+            # Apply feedback where error exceeds threshold
+            error_mask = estimated_error > error_threshold
+            
+            if torch.any(error_mask):
+                # For high error regions, add more steps (make steps smaller)
+                high_error_indices = torch.where(error_mask)[0]
+                
+                for idx in high_error_indices:
+                    if idx < len(result) - 1:
+                        # Insert a new point between idx and idx+1
+                        midpoint_value = (result[idx] + result[idx+1]) / 2
+                        
+                        # Adjust surrounding points
+                        result[idx] = result[idx] * (1 - feedback_strength) + (result[idx] + feedback_strength * (result[idx] - midpoint_value))
+                        result[idx+1] = result[idx+1] * (1 - feedback_strength) + (result[idx+1] + feedback_strength * (midpoint_value - result[idx+1]))
+        
+        # If preserving total steps, resample to original length
+        if preserve_total_steps:
+            result = torch.nn.functional.interpolate(
+                result.unsqueeze(0).unsqueeze(0), 
+                size=len(sigmas), 
+                mode='linear'
+            ).squeeze()
+            
+        # Normalize output if requested
+        if normalize_output:
+            start_value = result[0].item()
+            end_value = result[-1].item()
+            result = (result - result.min()) / (result.max() - result.min()) * (start_value - end_value) + end_value
+            result[0] = start_value
+            result[-1] = end_value
+            
+        return (result,)
+
+
+class sigmas_perceptual_loss:
+    def __init__(self):
+        pass
+    
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "steps": ("INT", {"default": 30, "min": 5, "max": 100, "step": 1}),
+                "start_value": ("FLOAT", {"default": 10.0, "min": 0.1, "max": 50.0, "step": 0.1}),
+                "end_value": ("FLOAT", {"default": 0.01, "min": 0.0, "max": 10.0, "step": 0.01}),
+                "perceptual_gamma": ("FLOAT", {"default": 2.2, "min": 1.0, "max": 5.0, "step": 0.1}),
+                "perceptual_emphasis": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "pad_end": ("BOOLEAN", {"default": True}),
+                "normalize_output": ("BOOLEAN", {"default": False})
+            }
+        }
+
+    FUNCTION = "main"
+    RETURN_TYPES = ("SIGMAS",)
+    CATEGORY = "RES4LYF/sigmas"
+    
+    def main(self, steps, start_value, end_value, perceptual_gamma, perceptual_emphasis, pad_end, normalize_output):
+        device = "cuda"
+        # Create base linear schedule
+        t = torch.linspace(0, 1, steps, device=device)
+        linear_schedule = start_value * (1 - t) + end_value * t
+        
+        # Apply perceptual scaling (similar to gamma correction in images)
+        # This allocates more steps to perceptually important regions
+        perceptual_t = t ** (1/perceptual_gamma)
+        perceptual_schedule = start_value * (1 - perceptual_t) + end_value * perceptual_t
+        
+        # Blend between linear and perceptual schedules
+        result = (1 - perceptual_emphasis) * linear_schedule + perceptual_emphasis * perceptual_schedule
+        
+        # Normalize output if requested
+        if normalize_output:
+            result = (result - result.min()) / (result.max() - result.min()) * (start_value - end_value) + end_value
+            result[0] = start_value
+            result[-1] = end_value
+        
+        # Add padding zero at the end if requested
+        if pad_end:
+            result = torch.cat([result, torch.tensor([0.0], device=device, dtype=result.dtype)])
+            
+        return (result,)
+
+
+class sigmas_symplectic_integrator:
+    def __init__(self):
+        pass
+    
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "steps": ("INT", {"default": 30, "min": 5, "max": 100, "step": 1}),
+                "start_value": ("FLOAT", {"default": 10.0, "min": 0.1, "max": 50.0, "step": 0.1}),
+                "end_value": ("FLOAT", {"default": 0.01, "min": 0.0, "max": 10.0, "step": 0.01}),
+                "integrator_type": (["verlet", "leapfrog", "stormer", "yoshida"], {"default": "verlet"}),
+                "conserve_factor": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "pad_end": ("BOOLEAN", {"default": True}),
+                "normalize_output": ("BOOLEAN", {"default": False})
+            }
+        }
+
+    FUNCTION = "main"
+    RETURN_TYPES = ("SIGMAS",)
+    CATEGORY = "RES4LYF/sigmas"
+    
+    def main(self, steps, start_value, end_value, integrator_type, conserve_factor, pad_end, normalize_output):
+        device = "cuda"
+        # Define a potential function (harmonic oscillator)
+        def potential(x):
+            return 0.5 * (x - end_value)**2
+            
+        # Define force function (negative gradient of potential)
+        def force(x):
+            return -(x - end_value)
+        
+        # Initialize position and velocity
+        x = torch.ones(1, device=device) * start_value
+        v = torch.zeros(1, device=device)
+        
+        # Time step
+        dt = torch.tensor(1.0 / steps, device=device)
+        
+        # Storage for trajectory
+        trajectory = [x.item()]
+        
+        # Apply symplectic integrator
+        if integrator_type == "verlet":
+            # Velocity Verlet integration
+            for _ in range(steps - 1):
+                # Half step in velocity
+                v += 0.5 * dt * force(x)
+                
+                # Full step in position
+                x += dt * v
+                
+                # Another half step in velocity
+                v += 0.5 * dt * force(x)
+                
+                # Apply conservation constraint
+                v *= (1.0 - conserve_factor * dt)  # Damping
+                
+                trajectory.append(x.item())
+                
+        elif integrator_type == "leapfrog":
+            # Leapfrog integration
+            v -= 0.5 * dt * force(x)  # Initial half-step backward
+            
+            for _ in range(steps - 1):
+                # Full position step
+                x += dt * v
+                
+                # Full velocity step
+                v -= dt * force(x)
+                
+                # Apply conservation constraint
+                v *= (1.0 - conserve_factor * dt)  # Damping
+                
+                trajectory.append(x.item())
+                
+        elif integrator_type == "stormer":
+            # Störmer-Verlet integration (position-focused)
+            x_prev = x.clone()
+            x_curr = x + dt * v + 0.5 * dt**2 * force(x)
+            trajectory.append(x_curr.item())
+            
+            for _ in range(steps - 2):
+                # Update using Störmer formula
+                x_next = 2 * x_curr - x_prev + dt**2 * force(x_curr)
+                
+                # Apply conservation
+                x_next = x_next * (1 - conserve_factor) + (x_curr + (x_curr - x_prev)) * conserve_factor
+                
+                x_prev = x_curr
+                x_curr = x_next
+                
+                trajectory.append(x_curr.item())
+                
+        elif integrator_type == "yoshida":
+            # Yoshida 4th order integrator
+            w0 = -(2**(1/3)) / (2 - 2**(1/3))
+            w1 = 1 / (2 - 2**(1/3))
+            
+            c = [w1/2, (w0+w1)/2, (w0+w1)/2, w1/2]
+            d = [w1, w0, w1, 0]
+            
+            for _ in range(steps - 1):
+                for i in range(4):
+                    # Position half-step
+                    x += c[i] * dt * v
+                    
+                    # Velocity step
+                    v += d[i] * dt * force(x)
+                
+                # Apply conservation constraint
+                v *= (1.0 - conserve_factor * dt)
+                
+                trajectory.append(x.item())
+        
+        # Convert to tensor
+        result = torch.tensor(trajectory, device=device)
+        
+        # Make sure end point is exactly end_value
+        result[-1] = end_value
+        
+        # Normalize output if requested
+        if normalize_output:
+            result = (result - result.min()) / (result.max() - result.min()) * (start_value - end_value) + end_value
+            result[0] = start_value
+            result[-1] = end_value
+        
+        # Add padding zero at the end if requested
+        if pad_end:
+            result = torch.cat([result, torch.tensor([0.0], device=device, dtype=result.dtype)])
+            
+        return (result,)
+
+
+class sigmas_accelerated_gradient:
+    def __init__(self):
+        pass
+    
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "steps": ("INT", {"default": 30, "min": 5, "max": 100, "step": 1}),
+                "start_value": ("FLOAT", {"default": 10.0, "min": 0.1, "max": 50.0, "step": 0.1}),
+                "end_value": ("FLOAT", {"default": 0.01, "min": 0.0, "max": 10.0, "step": 0.01}),
+                "acceleration": (["nesterov", "adagrad", "rmsprop", "momentum"], {"default": "nesterov"}),
+                "momentum_factor": ("FLOAT", {"default": 0.9, "min": 0.0, "max": 0.99, "step": 0.01}),
+                "pad_end": ("BOOLEAN", {"default": True}),
+                "normalize_output": ("BOOLEAN", {"default": False})
+            }
+        }
+
+    FUNCTION = "main"
+    RETURN_TYPES = ("SIGMAS",)
+    CATEGORY = "RES4LYF/sigmas"
+    
+    def main(self, steps, start_value, end_value, acceleration, momentum_factor, pad_end, normalize_output):
+        device = "cuda"
+        # Define the objective function (minimize distance to end_value)
+        def objective(x):
+            return (x - end_value)**2
+            
+        def gradient(x):
+            return 2 * (x - end_value)
+        
+        # Initialize position
+        x = torch.ones(1, device=device) * start_value
+        
+        # Initialize algorithm-specific variables
+        velocity = torch.zeros(1, device=device)
+        acc_gradient = torch.zeros(1, device=device)
+        
+        # Learning rate
+        lr = torch.tensor((start_value - end_value) / steps, device=device)
+        
+        # Storage for trajectory
+        trajectory = [x.item()]
+        
+        # Apply accelerated gradient method
+        if acceleration == "nesterov":
+            # Nesterov Accelerated Gradient
+            for i in range(steps - 1):
+                # Compute β for the current iteration
+                beta = torch.tensor(3.0 / (5.0 + i), device=device)  # Adaptive scheme
+                
+                # Lookahead step (Nesterov's trick)
+                x_lookahead = x - beta * velocity
+                
+                # Update velocity with lookahead gradient
+                velocity = momentum_factor * velocity + lr * gradient(x_lookahead)
+                
+                # Update position
+                x = x - velocity
+                
+                trajectory.append(x.item())
+                
+        elif acceleration == "adagrad":
+            # Adagrad
+            for _ in range(steps - 1):
+                # Compute gradient
+                grad = gradient(x)
+                
+                # Accumulate squared gradients
+                acc_gradient += grad**2
+                
+                # Update position with adaptive learning rate
+                x = x - lr * grad / torch.sqrt(acc_gradient + 1e-8)
+                
+                trajectory.append(x.item())
+                
+        elif acceleration == "rmsprop":
+            # RMSProp
+            decay_rate = torch.tensor(0.9, device=device)
+            
+            for _ in range(steps - 1):
+                # Compute gradient
+                grad = gradient(x)
+                
+                # Update accumulated gradient
+                acc_gradient = decay_rate * acc_gradient + (1 - decay_rate) * grad**2
+                
+                # Update position
+                x = x - lr * grad / torch.sqrt(acc_gradient + 1e-8)
+                
+                trajectory.append(x.item())
+                
+        elif acceleration == "momentum":
+            # Standard Momentum
+            for _ in range(steps - 1):
+                # Compute gradient
+                grad = gradient(x)
+                
+                # Update velocity
+                velocity = momentum_factor * velocity + lr * grad
+                
+                # Update position
+                x = x - velocity
+                
+                trajectory.append(x.item())
+        
+        # Convert to tensor
+        result = torch.tensor(trajectory, device=device)
+        
+        # Make sure end point is exactly end_value
+        result[-1] = end_value
+        
+        # Normalize output if requested
+        if normalize_output:
+            result = (result - result.min()) / (result.max() - result.min()) * (start_value - end_value) + end_value
+            result[0] = start_value
+            result[-1] = end_value
+        
+        # Add padding zero at the end if requested
+        if pad_end:
+            result = torch.cat([result, torch.tensor([0.0], device=device, dtype=result.dtype)])
+            
+        return (result,)
+
+
+class sigmas_phase_space:
+    def __init__(self):
+        pass
+    
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "steps": ("INT", {"default": 30, "min": 5, "max": 100, "step": 1}),
+                "start_value": ("FLOAT", {"default": 10.0, "min": 0.1, "max": 50.0, "step": 0.1}),
+                "end_value": ("FLOAT", {"default": 0.01, "min": 0.0, "max": 10.0, "step": 0.01}),
+                "phase_strategy": (["hamiltonian", "canonical", "action_angle"], {"default": "hamiltonian"}),
+                "energy_conservation": ("FLOAT", {"default": 0.9, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "pad_end": ("BOOLEAN", {"default": True}),
+                "normalize_output": ("BOOLEAN", {"default": False})
+            }
+        }
+
+    FUNCTION = "main"
+    RETURN_TYPES = ("SIGMAS",)
+    CATEGORY = "RES4LYF/sigmas"
+    
+    def main(self, steps, start_value, end_value, phase_strategy, energy_conservation, pad_end, normalize_output):
+        device = "cuda"
+        # Define Hamiltonian energy function
+        def hamiltonian(q, p):
+            # Kinetic energy + potential energy
+            return 0.5 * p**2 + 0.5 * (q - end_value)**2
+            
+        # Position and momentum partial derivatives
+        def dq_dt(q, p):
+            return p  # dH/dp
+            
+        def dp_dt(q, p):
+            return -(q - end_value)  # -dH/dq
+        
+        # Initialize position and momentum
+        q = torch.ones(1, device=device) * start_value
+        
+        # Set initial momentum for different strategies
+        if phase_strategy == "hamiltonian":
+            # Standard Hamiltonian trajectory
+            p = torch.zeros(1, device=device)
+        elif phase_strategy == "canonical":
+            # Canonical ensemble (thermodynamic)
+            p = torch.randn(1, device=device) * torch.sqrt(torch.abs(torch.tensor(start_value - end_value, device=device)))
+        elif phase_strategy == "action_angle":
+            # Action-angle variables (oscillatory)
+            p = torch.sin(torch.tensor([math.pi/4], device=device)) * (start_value - end_value)
+            
+        # Time step
+        dt = torch.tensor(1.0 / steps, device=device)
+        
+        # Initial energy
+        initial_energy = hamiltonian(q, p)
+        
+        # Storage for trajectory
+        trajectory = [q.item()]
+        
+        # Symplectic integration in phase space
+        for i in range(1, steps):
+            # Update position and momentum using leapfrog integration
+            p = p + 0.5 * dt * dp_dt(q, p)
+            q = q + dt * dq_dt(q, p)
+            p = p + 0.5 * dt * dp_dt(q, p)
+            
+            # Energy conservation constraint
+            current_energy = hamiltonian(q, p)
+            if current_energy > 0 and initial_energy > 0:
+                # Scale momentum to preserve energy (partially)
+                energy_ratio = (initial_energy / current_energy) ** 0.5
+                energy_ratio = 1.0 + (energy_ratio - 1.0) * energy_conservation
+                p = p * energy_ratio
+                
+            # Track position
+            trajectory.append(q.item())
+            
+            # Gradually guide to the end value in later steps
+            if i > steps * 0.8:
+                # Add a small force directing towards end_value
+                force_factor = (i - steps * 0.8) / (steps * 0.2)
+                q = q * (1 - 0.1 * force_factor) + end_value * 0.1 * force_factor
+        
+        # Convert to tensor
+        result = torch.tensor(trajectory, device=device)
+        
+        # Make sure end point is exactly end_value
+        result[-1] = end_value
+        
+        # Normalize output if requested
+        if normalize_output:
+            result = (result - result.min()) / (result.max() - result.min()) * (start_value - end_value) + end_value
+            result[0] = start_value
+            result[-1] = end_value
+        
+        # Add padding zero at the end if requested
+        if pad_end:
+            result = torch.cat([result, torch.tensor([0.0], device=device, dtype=result.dtype)])
+            
+        return (result,)
+
+
+class sigmas_reverse_kl:
+    def __init__(self):
+        pass
+    
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "steps": ("INT", {"default": 30, "min": 5, "max": 100, "step": 1}),
+                "start_value": ("FLOAT", {"default": 10.0, "min": 0.1, "max": 50.0, "step": 0.1}),
+                "end_value": ("FLOAT", {"default": 0.01, "min": 0.0, "max": 10.0, "step": 0.01}),
+                "alpha": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "beta": ("FLOAT", {"default": 2.0, "min": 0.1, "max": 10.0, "step": 0.1}),
+                "pad_end": ("BOOLEAN", {"default": True}),
+                "normalize_output": ("BOOLEAN", {"default": False})
+            }
+        }
+
+    FUNCTION = "main"
+    RETURN_TYPES = ("SIGMAS",)
+    CATEGORY = "RES4LYF/sigmas"
+    
+    def main(self, steps, start_value, end_value, alpha, beta, pad_end, normalize_output):
+        device = "cuda"
+        # Create time steps
+        t = torch.linspace(0, 1, steps, device=device)
+        
+        # Standard forward KL divergence path (quadratic)
+        forward_kl = start_value * (1 - t)**2 + end_value * (1 - (1 - t)**2)
+        
+        # Reverse KL path (focuses more on mode coverage)
+        # Using a skewed logistic function to approximate reverse KL optimal path
+        reverse_kl = start_value * (1 - torch.sigmoid((t - alpha) * beta)) + end_value * torch.sigmoid((t - alpha) * beta)
+        
+        # Hybrid approach: combine both paths
+        # Early process: more focus on forward KL
+        # Later process: more focus on reverse KL
+        blending = torch.sigmoid(5 * (t - 0.5))  # Sigmoid blending factor
+        result = (1 - blending) * forward_kl + blending * reverse_kl
+        
+        # Normalize output if requested
+        if normalize_output:
+            result = (result - result.min()) / (result.max() - result.min()) * (start_value - end_value) + end_value
+            result[0] = start_value
+            result[-1] = end_value
+        
+        # Add padding zero at the end if requested
+        if pad_end:
+            result = torch.cat([result, torch.tensor([0.0], device=device, dtype=result.dtype)])
+            
+        return (result,)
+
+
+class sigmas_mutual_information:
+    def __init__(self):
+        pass
+    
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "steps": ("INT", {"default": 30, "min": 5, "max": 100, "step": 1}),
+                "start_value": ("FLOAT", {"default": 10.0, "min": 0.1, "max": 50.0, "step": 0.1}),
+                "end_value": ("FLOAT", {"default": 0.01, "min": 0.0, "max": 10.0, "step": 0.01}),
+                "information_rate": (["constant", "decreasing", "oscillatory"], {"default": "decreasing"}),
+                "rate_parameter": ("FLOAT", {"default": 0.5, "min": 0.01, "max": 2.0, "step": 0.01}),
+                "pad_end": ("BOOLEAN", {"default": True}),
+                "normalize_output": ("BOOLEAN", {"default": False})
+            }
+        }
+
+    FUNCTION = "main"
+    RETURN_TYPES = ("SIGMAS",)
+    CATEGORY = "RES4LYF/sigmas"
+    
+    def main(self, steps, start_value, end_value, information_rate, rate_parameter, pad_end, normalize_output):
+        device = "cuda"
+        # Initialize result
+        result = torch.zeros(steps, device=device)
+        result[0] = start_value
+        
+        # Information transport rate determines step sizes
+        if information_rate == "constant":
+            # Constant information change per step - often exponential curve
+            # mutual information ~ log(sigma_t/sigma_{t+1})
+            log_ratio = torch.log(torch.tensor(start_value / end_value, device=device))
+            info_per_step = log_ratio / (steps - 1)
+            
+            for i in range(1, steps):
+                result[i] = result[i-1] * torch.exp(-info_per_step)
+                
+        elif information_rate == "decreasing":
+            # Decreasing information rate - more steps early on
+            # Rate decreases according to power law
+            t = torch.linspace(0, 1, steps, device=device)
+            decay_factor = t ** rate_parameter
+            
+            # Normalize to ensure we reach end_value
+            normalized_decay = decay_factor / decay_factor.sum()
+            cumulative_info = torch.cumsum(normalized_decay, dim=0) * torch.log(torch.tensor(start_value / end_value, device=device))
+            
+            result = start_value * torch.exp(-cumulative_info)
+            
+        elif information_rate == "oscillatory":
+            # Oscillatory information rate - alternating between high and low info steps
+            base_log_ratio = torch.log(torch.tensor(start_value / end_value, device=device)) / (steps - 1)
+            
+            for i in range(1, steps):
+                # Add oscillation to information rate
+                oscillation = 0.5 * rate_parameter * torch.sin(torch.tensor(2 * math.pi * i / (steps / 5), device=device))
+                adjusted_ratio = base_log_ratio * (1 + oscillation)
+                
+                # Update with adjusted ratio
+                result[i] = result[i-1] * torch.exp(-adjusted_ratio)
+                
+            # Re-normalize to ensure endpoints match
+            result = start_value * (result / result[0])
+            result[-1] = end_value  # Ensure exact match
+        
+        # Normalize output if requested
+        if normalize_output:
+            result = (result - result.min()) / (result.max() - result.min()) * (start_value - end_value) + end_value
+            result[0] = start_value
+            result[-1] = end_value
+            
+        # Add padding zero at the end if requested
+        if pad_end:
+            result = torch.cat([result, torch.tensor([0.0], device=device, dtype=result.dtype)])
+            
+        return (result,)
+
+
+class sigmas_cross_entropy:
+    def __init__(self):
+        pass
+    
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "steps": ("INT", {"default": 30, "min": 5, "max": 100, "step": 1}),
+                "start_value": ("FLOAT", {"default": 10.0, "min": 0.1, "max": 50.0, "step": 0.1}),
+                "end_value": ("FLOAT", {"default": 0.01, "min": 0.0, "max": 10.0, "step": 0.01}),
+                "cross_entropy_focus": (["precision", "recall", "balanced"], {"default": "balanced"}),
+                "robustness": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "pad_end": ("BOOLEAN", {"default": True}),
+                "normalize_output": ("BOOLEAN", {"default": False})
+            }
+        }
+
+    FUNCTION = "main"
+    RETURN_TYPES = ("SIGMAS",)
+    CATEGORY = "RES4LYF/sigmas"
+    
+    def main(self, steps, start_value, end_value, cross_entropy_focus, robustness, pad_end, normalize_output):
+        device = "cuda"
+        # Create time steps
+        t = torch.linspace(0, 1, steps, device=device)
+        
+        if cross_entropy_focus == "precision":
+            # Focus on precision (harder denoising steps at the beginning)
+            # Cross-entropy optimal for precision uses higher noise levels longer
+            # a*(1-t)^b form with b < 1
+            b = 0.7 - 0.4 * robustness  # Lower b = more focus on precision
+            sigma_values = start_value * (1 - t)**b + end_value * (1 - (1 - t)**b)
+            
+        elif cross_entropy_focus == "recall":
+            # Focus on recall (harder denoising steps at the end)
+            # Cross-entropy optimal for recall uses faster noise reduction early
+            # Uses a sigmoid-based transition
+            midpoint = 0.7 - 0.4 * robustness  # Higher midpoint = more focus on recall
+            slope = 8 + 4 * robustness
+            sigma_values = start_value * (1 - torch.sigmoid(slope * (t - midpoint))) + end_value * torch.sigmoid(slope * (t - midpoint))
+            
+        else:  # balanced
+            # Balanced approach (balanced precision and recall)
+            # Uses a smoother transition, approximating optimal cross-entropy path
+            # Approximated by beta distribution CDF
+            alpha = 2 - robustness
+            beta_param = 2 - robustness
+            
+            # Approximation of beta CDF using incomplete beta function
+            # Using a simpler approximation with torch
+            normalized_t = torch.clamp(t, 0.001, 0.999)  # Avoid extremes for numerical stability
+            beta_cdf = torch.pow(normalized_t, alpha) / (torch.pow(normalized_t, alpha) + torch.pow(1 - normalized_t, beta_param))
+            
+            sigma_values = start_value * (1 - beta_cdf) + end_value * beta_cdf
+        
+        # Normalize output if requested
+        if normalize_output:
+            sigma_values = (sigma_values - sigma_values.min()) / (sigma_values.max() - sigma_values.min()) * (start_value - end_value) + end_value
+            sigma_values[0] = start_value
+            sigma_values[-1] = end_value
+        
+        # Add padding zero at the end if requested
+        if pad_end:
+            sigma_values = torch.cat([sigma_values, torch.tensor([0.0], device=device, dtype=sigma_values.dtype)])
+            
+        return (sigma_values,)
+
+
+class sigmas_manifold_preserving:
+    def __init__(self):
+        pass
+    
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "steps": ("INT", {"default": 30, "min": 5, "max": 100, "step": 1}),
+                "start_value": ("FLOAT", {"default": 10.0, "min": 0.1, "max": 50.0, "step": 0.1}),
+                "end_value": ("FLOAT", {"default": 0.01, "min": 0.0, "max": 10.0, "step": 0.01}),
+                "manifold_dim": ("INT", {"default": 2, "min": 1, "max": 10, "step": 1}),
+                "curvature": ("FLOAT", {"default": 0.2, "min": -1.0, "max": 1.0, "step": 0.01}),
+                "pad_end": ("BOOLEAN", {"default": True}),
+                "normalize_output": ("BOOLEAN", {"default": False})
+            }
+        }
+
+    FUNCTION = "main"
+    RETURN_TYPES = ("SIGMAS",)
+    CATEGORY = "RES4LYF/sigmas"
+    
+    def main(self, steps, start_value, end_value, manifold_dim, curvature, pad_end, normalize_output):
+        device = "cuda"
+        # Create normalized parameter space
+        t = torch.linspace(0, 1, steps, device=device)
+        
+        # Calculate effective dimensionality factor
+        # Higher dimensions require special handling to preserve manifold structure
+        dim_factor = torch.sqrt(torch.tensor(manifold_dim, dtype=torch.float32, device=device))
+        
+        if curvature > 0:
+            # Positive curvature (spherical-like manifold)
+            # Use spherical coordinates transformation
+            # Adapted path length accounting for positive curvature
+            theta = t * torch.pi/2  # Angle from 0 to π/2
+            radius = torch.sin(theta * (1 + curvature * 0.5))
+            sigma_values = start_value * (1 - radius) + end_value * radius
+            
+        elif curvature < 0:
+            # Negative curvature (hyperbolic-like manifold)
+            # Use hyperbolic transformation
+            # Path is longer in negatively curved space
+            # Convert curvature to tensor
+            curv_tensor = torch.tensor(abs(curvature), device=device)
+            sinh_factor = torch.sinh(t * dim_factor * curv_tensor)
+            normalized = sinh_factor / sinh_factor[-1]  # Normalize to [0,1]
+            sigma_values = start_value * (1 - normalized) + end_value * normalized
+            
+        else:
+            # Zero curvature (flat manifold)
+            # Standard interpolation with dimension scaling
+            # Higher dimensions need more even spacing due to curse of dimensionality
+            power = 1.0 / dim_factor
+            normalized = torch.pow(t, power)
+            sigma_values = start_value * (1 - normalized) + end_value * normalized
+        
+        # Normalize output if requested
+        if normalize_output:
+            sigma_values = (sigma_values - sigma_values.min()) / (sigma_values.max() - sigma_values.min()) * (start_value - end_value) + end_value
+            sigma_values[0] = start_value
+            sigma_values[-1] = end_value
+        
+        # Add padding zero at the end if requested
+        if pad_end:
+            sigma_values = torch.cat([sigma_values, torch.tensor([0.0], device=device, dtype=sigma_values.dtype)])
+            
+        return (sigma_values,)
+
+
+class sigmas_curvature_geodesic:
+    def __init__(self):
+        pass
+    
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "steps": ("INT", {"default": 30, "min": 5, "max": 100, "step": 1}),
+                "start_value": ("FLOAT", {"default": 10.0, "min": 0.1, "max": 50.0, "step": 0.1}),
+                "end_value": ("FLOAT", {"default": 0.01, "min": 0.0, "max": 10.0, "step": 0.01}),
+                "metric_type": (["euclidean", "riemannian", "lognormal", "wasserstein"], {"default": "riemannian"}),
+                "curvature_weight": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "pad_end": ("BOOLEAN", {"default": True}),
+                "normalize_output": ("BOOLEAN", {"default": False})
+            }
+        }
+
+    FUNCTION = "main"
+    RETURN_TYPES = ("SIGMAS",)
+    CATEGORY = "RES4LYF/sigmas"
+    
+    def main(self, steps, start_value, end_value, metric_type, curvature_weight, pad_end, normalize_output):
+        device = "cuda"
+        # Create parameter space
+        t = torch.linspace(0, 1, steps, device=device)
+        
+        if metric_type == "euclidean":
+            # Standard Euclidean geodesic (straight line)
+            sigma_values = start_value * (1 - t) + end_value * t
+            
+        elif metric_type == "riemannian":
+            # Riemannian metric for diffusion models
+            # This uses a custom metric where distance is measured by log ratio
+            # Geodesic follows exponential decay
+            log_ratio = torch.log(torch.tensor(start_value / end_value, device=device))
+            sigma_values = start_value * torch.exp(-t * log_ratio)
+            
+        elif metric_type == "lognormal":
+            # Log-normal metric (natural for variance parameters)
+            # Geodesic in this space follows a geometric sequence
+            log_start = torch.log(torch.tensor(start_value, device=device))
+            log_end = torch.log(torch.tensor(end_value, device=device))
+            sigma_values = torch.exp(log_start * (1 - t) + log_end * t)
+            
+        elif metric_type == "wasserstein":
+            # 2-Wasserstein metric (optimal transport)
+            # Square root interpolation of variance parameters
+            sqrt_start = torch.sqrt(torch.tensor(start_value, device=device))
+            sqrt_end = torch.sqrt(torch.tensor(end_value, device=device))
+            sigma_values = (sqrt_start * (1 - t) + sqrt_end * t) ** 2
+        
+        # Apply curvature-aware adjustment (focusing more on high-curvature regions)
+        if curvature_weight > 0:
+            # Compute approximate scalar curvature in the path
+            # Second derivative approximation
+            curvature = torch.zeros_like(sigma_values)
+            curvature[1:-1] = torch.abs(sigma_values[2:] - 2 * sigma_values[1:-1] + sigma_values[:-2])
+            curvature[0] = curvature[1]
+            curvature[-1] = curvature[-2]
+            
+            # Normalize curvature
+            norm_curvature = curvature / (curvature.max() + 1e-8)
+            
+            # Adaptive step size based on curvature
+            # More steps in high curvature regions
+            step_size_weights = 1.0 / (1.0 + curvature_weight * norm_curvature)
+            step_size_weights = step_size_weights / step_size_weights.sum()
+            
+            # Compute adjusted t values
+            t_adjusted = torch.cumsum(step_size_weights, dim=0)
+            t_adjusted = t_adjusted / t_adjusted[-1]  # Normalize to [0,1]
+            
+            # Recompute sigma values with adjusted t
+            if metric_type == "euclidean":
+                sigma_values = start_value * (1 - t_adjusted) + end_value * t_adjusted
+            elif metric_type == "riemannian":
+                sigma_values = start_value * torch.exp(-t_adjusted * log_ratio)
+            elif metric_type == "lognormal":
+                sigma_values = torch.exp(log_start * (1 - t_adjusted) + log_end * t_adjusted)
+            elif metric_type == "wasserstein":
+                sigma_values = (sqrt_start * (1 - t_adjusted) + sqrt_end * t_adjusted) ** 2
+        
+        # Normalize output if requested
+        if normalize_output:
+            sigma_values = (sigma_values - sigma_values.min()) / (sigma_values.max() - sigma_values.min()) * (start_value - end_value) + end_value
+            sigma_values[0] = start_value
+            sigma_values[-1] = end_value
+        
+        # Add padding zero at the end if requested
+        if pad_end:
+            sigma_values = torch.cat([sigma_values, torch.tensor([0.0], device=device, dtype=sigma_values.dtype)])
+            
+        return (sigma_values,)
+    
+    
+class sigmas_persistent_homology:
+    def __init__(self):
+        pass
+    
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "steps": ("INT", {"default": 30, "min": 5, "max": 100, "step": 1}),
+                "start_value": ("FLOAT", {"default": 10.0, "min": 0.1, "max": 50.0, "step": 0.1}),
+                "end_value": ("FLOAT", {"default": 0.01, "min": 0.0, "max": 10.0, "step": 0.01}),
+                "persistence_type": (["linear", "exponential", "logarithmic", "critical_points"], {"default": "critical_points"}),
+                "persistence_param": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "pad_end": ("BOOLEAN", {"default": True}),
+                "normalize_output": ("BOOLEAN", {"default": False})
+            }
+        }
+
+    FUNCTION = "main"
+    RETURN_TYPES = ("SIGMAS",)
+    CATEGORY = "RES4LYF/sigmas"
+    
+    def main(self, steps, start_value, end_value, persistence_type, persistence_param, pad_end, normalize_output):
+        device = "cuda"
+        # Initialize result
+        result = torch.zeros(steps, device=device)
+        
+        if persistence_type == "linear":
+            # Linear filtration with persistence-based weighting
+            t = torch.linspace(0, 1, steps, device=device)
+            result = start_value * (1 - t) + end_value * t
+            
+        elif persistence_type == "exponential":
+            # Exponential decay filtration (standard in TDA)
+            log_ratio = torch.log(torch.tensor(start_value / end_value, device=device))
+            t = torch.linspace(0, 1, steps, device=device)
+            result = start_value * torch.exp(-t * log_ratio)
+            
+        elif persistence_type == "logarithmic":
+            # Logarithmic filtration (slower initial decay)
+            t = torch.linspace(0, 1, steps, device=device)
+            # log(1+t)/log(2) ranges from 0 to 1 as t goes from 0 to 1
+            log_t = torch.log(1 + t) / torch.log(torch.tensor(2.0, device=device))
+            result = start_value * (1 - log_t) + end_value * log_t
+            
+        elif persistence_type == "critical_points":
+            # Critical points filtration based on persistence diagram
+            # Simulates persistence diagram with more critical points at specific scales
+            
+            # Create persistence diagram (birth, death) pairs
+            # These are key scales where topological features appear/disappear
+            n_critical = int(5 + 10 * persistence_param)  # Number of critical points
+            
+            # Simple simulation of persistence diagram with controlled distribution
+            persistence_points = []
+            
+            # Add some fixed critical points
+            persistence_points.append((0.8, 0.6))  # High persistence feature at 0.8 scale
+            persistence_points.append((0.5, 0.4))  # Medium persistence feature at 0.5 scale
+            persistence_points.append((0.2, 0.15)) # Low persistence feature at 0.2 scale
+            
+            # Add random critical points with persistence-dependent distribution
+            for _ in range(n_critical - 3):
+                # Birth time biased by persistence parameter
+                birth = 0.1 + 0.8 * (torch.rand(1, device=device).item() ** (1.5 - persistence_param))
+                # Death time proportional to birth (higher persistence at higher scales)
+                persistence = 0.05 + 0.15 * torch.rand(1, device=device).item() * birth
+                death = birth - persistence
+                death = max(0.01, death)  # Ensure death > 0
+                persistence_points.append((birth, death))
+            
+            # Convert to tensor format
+            birth_times = torch.tensor([p[0] for p in persistence_points], device=device)
+            death_times = torch.tensor([p[1] for p in persistence_points], device=device)
+            
+            # Create filtration guided by persistence diagram
+            t = torch.linspace(0, 1, steps, device=device)
+            
+            # Reshape filtration based on critical points
+            filtration = torch.zeros_like(t)
+            
+            for i, ti in enumerate(t):
+                # Convert normalized t to scale parameter
+                scale = 1.0 - ti.item()  # Higher scale at beginning
+                
+                # Count features alive at this scale
+                alive_count = ((birth_times >= scale) & (death_times <= scale)).float().sum()
+                
+                # Normalize to [0,1] by expected maximum
+                filtration[i] = torch.clamp(alive_count / n_critical, 0.0, 1.0)
+            
+            # Convert to sigma values
+            result = start_value * (1 - filtration) + end_value * filtration
+            
+        # Ensure endpoints match exactly
+        result[0] = start_value
+        result[-1] = end_value
+        
+        # Normalize output if requested
+        if normalize_output:
+            result = (result - result.min()) / (result.max() - result.min()) * (start_value - end_value) + end_value
+            result[0] = start_value
+            result[-1] = end_value
+        
+        # Add padding zero at the end if requested
+        if pad_end:
+            result = torch.cat([result, torch.tensor([0.0], device=device, dtype=result.dtype)])
+            
+        return (result,)
+
+
+# Hybrid Functions
+
+class sigmas_multi_resolution:
+    def __init__(self):
+        pass
+    
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "steps": ("INT", {"default": 30, "min": 5, "max": 100, "step": 1}),
+                "start_value": ("FLOAT", {"default": 10.0, "min": 0.1, "max": 50.0, "step": 0.1}),
+                "end_value": ("FLOAT", {"default": 0.01, "min": 0.0, "max": 10.0, "step": 0.01}),
+                "cascade_levels": ("INT", {"default": 3, "min": 1, "max": 5, "step": 1}),
+                "level_ratios": ("STRING", {"default": "0.5,0.3,0.2", "multiline": False}),
+                "pad_end": ("BOOLEAN", {"default": True}),
+                "normalize_output": ("BOOLEAN", {"default": False})
+            }
+        }
+
+    FUNCTION = "main"
+    RETURN_TYPES = ("SIGMAS",)
+    CATEGORY = "RES4LYF/sigmas"
+    
+    def main(self, steps, start_value, end_value, cascade_levels, level_ratios, pad_end, normalize_output):
+        device = "cuda"
+        # Parse level ratios
+        try:
+            ratios = [float(x) for x in level_ratios.split(',')]
+            # Ensure we have enough ratios for the cascade levels
+            if len(ratios) < cascade_levels:
+                ratios.extend([0.1] * (cascade_levels - len(ratios)))
+            # Normalize ratios to sum to 1
+            ratios = torch.tensor(ratios[:cascade_levels], device=device)
+            ratios = ratios / ratios.sum()
+        except:
+            # Default fallback if parsing fails
+            ratios = torch.ones(cascade_levels, device=device) / cascade_levels
+        
+        # Calculate steps per level
+        steps_per_level = [max(2, int(steps * r.item())) for r in ratios]
+        
+        # Adjust to match total steps
+        while sum(steps_per_level) > steps:
+            # Remove from the level with the most steps
+            max_idx = steps_per_level.index(max(steps_per_level))
+            steps_per_level[max_idx] -= 1
+        
+        while sum(steps_per_level) < steps:
+            # Add to the level with the least steps
+            min_idx = steps_per_level.index(min(steps_per_level))
+            steps_per_level[min_idx] += 1
+        
+        # Calculate intermediate values between levels
+        level_values = torch.zeros(cascade_levels + 1, device=device)
+        level_values[0] = start_value
+        level_values[-1] = end_value
+        
+        if cascade_levels > 1:
+            # Calculate intermediate pivot points
+            # Using a logarithmic distribution for better sigma spacing
+            log_start = torch.log(torch.tensor(start_value, device=device))
+            log_end = torch.log(torch.tensor(end_value, device=device))
+            log_range = log_start - log_end
+            
+            # Place intermediate levels at logarithmically spaced points
+            for i in range(1, cascade_levels):
+                position = i / cascade_levels
+                # Bias toward spending more steps at higher noise levels
+                adjusted_pos = position ** 1.5
+                log_val = log_start - adjusted_pos * log_range
+                level_values[i] = torch.exp(log_val)
+        
+        # Create multi-resolution cascade
+        result = torch.zeros(steps, device=device)
+        current_idx = 0
+        
+        for level in range(cascade_levels):
+            level_step_count = steps_per_level[level]
+            start_val = level_values[level].item()
+            end_val = level_values[level + 1].item()
+            
+            # Choose different interpolation strategy per level
+            if level == 0:
+                # First level - more steps early (capturing large structures)
+                # Cosine interpolation
+                t = torch.linspace(0, 1, level_step_count, device=device)
+                level_sigmas = start_val * torch.cos(t * torch.pi/2) + end_val * (1 - torch.cos(t * torch.pi/2))
+            elif level == cascade_levels - 1:
+                # Last level - more steps late (fine details)
+                # Power function
+                t = torch.linspace(0, 1, level_step_count, device=device)
+                power = torch.tensor(0.7, device=device)
+                level_sigmas = start_val * (1 - t**power) + end_val * t**power
+            else:
+                # Middle levels - balanced
+                # Linear interpolation
+                t = torch.linspace(0, 1, level_step_count, device=device)
+                level_sigmas = start_val * (1 - t) + end_val * t
+            
+            # Add to result
+            result[current_idx:current_idx + level_step_count] = level_sigmas
+            current_idx += level_step_count
+        
+        # Normalize output if requested
+        if normalize_output:
+            result = (result - result.min()) / (result.max() - result.min()) * (start_value - end_value) + end_value
+            result[0] = start_value
+            result[-1] = end_value
+        
+        # Add padding zero at the end if requested
+        if pad_end:
+            result = torch.cat([result, torch.tensor([0.0], device=device, dtype=result.dtype)])
+            
+        return (result,)
+
+
+class sigmas_sde_ode_hybrid:
+    def __init__(self):
+        pass
+    
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "steps": ("INT", {"default": 30, "min": 5, "max": 100, "step": 1}),
+                "start_value": ("FLOAT", {"default": 10.0, "min": 0.1, "max": 50.0, "step": 0.1}),
+                "end_value": ("FLOAT", {"default": 0.01, "min": 0.0, "max": 10.0, "step": 0.01}),
+                "transition_point": ("FLOAT", {"default": 0.5, "min": 0.1, "max": 0.9, "step": 0.01}),
+                "sde_coefficient": ("FLOAT", {"default": 0.2, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "pad_end": ("BOOLEAN", {"default": True}),
+                "normalize_output": ("BOOLEAN", {"default": False})
+            }
+        }
+
+    FUNCTION = "main"
+    RETURN_TYPES = ("SIGMAS",)
+    CATEGORY = "RES4LYF/sigmas"
+    
+    def main(self, steps, start_value, end_value, transition_point, sde_coefficient, pad_end, normalize_output):
+        device = "cuda"
+        # Convert transition point to step index
+        transition_step = int(steps * transition_point)
+        transition_step = max(1, min(transition_step, steps - 1))  # Ensure valid range
+        
+        # Create time steps
+        t = torch.linspace(0, 1, steps, device=device)
+        
+        # SDE portion (first part) - with noise term
+        # Using Variance Preserving SDE formulation
+        def sde_drift(t_val, sigma_val):
+            return -0.5 * sigma_val / (1 - t_val)
+        
+        def sde_diffusion(t_val):
+            return torch.sqrt(torch.tensor(sde_coefficient, device=device))
+        
+        # ODE portion (second part) - deterministic
+        # Using probability flow ODE
+        def ode_drift(t_val, sigma_val):
+            return -sigma_val / (1 - t_val)
+        
+        # Initialize with start value
+        sigma_values = torch.zeros(steps, device=device)
+        sigma_values[0] = start_value
+        
+        # SDE integration for first portion
+        for i in range(1, transition_step):
+            dt = t[i] - t[i-1]
+            
+            # Euler-Maruyama method for SDE
+            drift = sde_drift(t[i-1], sigma_values[i-1]) * dt
+            diffusion = sde_diffusion(t[i-1]) * torch.sqrt(dt) * torch.randn(1, device=device)
+            
+            sigma_values[i] = sigma_values[i-1] + drift + diffusion
+        
+        # Compute intermediate value at transition point
+        transition_value = sigma_values[transition_step-1]
+        
+        # Determine target end value for ODE portion
+        # Ensure smooth transition by matching expected trajectory
+        expected_drift = sde_drift(t[transition_step-1], transition_value)
+        expected_next = transition_value + expected_drift * (t[transition_step] - t[transition_step-1])
+        
+        # ODE integration for second portion (probability flow)
+        # Set up ODE with adjusted end point
+        t_ode = (t[transition_step:] - t[transition_step]) / (1 - t[transition_step])
+        
+        # Exponential solution to the ODE
+        remaining_steps = steps - transition_step
+        log_ratio = torch.log(torch.tensor(expected_next / end_value, device=device))
+        
+        ode_values = expected_next * torch.exp(-t_ode * log_ratio)
+        sigma_values[transition_step:] = ode_values
+        
+        # Ensure end value is exactly as specified
+        sigma_values[-1] = end_value
+        
+        # Normalize output if requested
+        if normalize_output:
+            sigma_values = (sigma_values - sigma_values.min()) / (sigma_values.max() - sigma_values.min()) * (start_value - end_value) + end_value
+            sigma_values[0] = start_value
+            sigma_values[-1] = end_value
+        
+        # Add padding zero at the end if requested
+        if pad_end:
+            sigma_values = torch.cat([sigma_values, torch.tensor([0.0], device=device, dtype=sigma_values.dtype)])
+            
+        return (sigma_values,)
+
+
+class sigmas_progressive_distillation:
+    def __init__(self):
+        pass
+    
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "steps": ("INT", {"default": 30, "min": 5, "max": 100, "step": 1}),
+                "start_value": ("FLOAT", {"default": 10.0, "min": 0.1, "max": 50.0, "step": 0.1}),
+                "end_value": ("FLOAT", {"default": 0.01, "min": 0.0, "max": 10.0, "step": 0.01}),
+                "distillation_rounds": ("INT", {"default": 3, "min": 1, "max": 5, "step": 1}),
+                "distillation_alpha": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "pad_end": ("BOOLEAN", {"default": True}),
+                "normalize_output": ("BOOLEAN", {"default": False})
+            }
+        }
+
+    FUNCTION = "main"
+    RETURN_TYPES = ("SIGMAS",)
+    CATEGORY = "RES4LYF/sigmas"
+    
+    def main(self, steps, start_value, end_value, distillation_rounds, distillation_alpha, pad_end, normalize_output):
+        device = "cuda"
+        # Start with a basic cosine noise schedule
+        t = torch.linspace(0, 1, steps, device=device)
+        base_schedule = start_value * torch.cos(t * torch.pi/2) + end_value * (1 - torch.cos(t * torch.pi/2))
+        
+        # Progressive distillation simulation
+        current_schedule = base_schedule
+        
+        for r in range(distillation_rounds):
+            # Teacher model (current schedule)
+            teacher_schedule = current_schedule.clone()
+            
+            # Student model (trying to learn from half the steps)
+            # In real distillation, the student would have half the step count
+            # Here we're simulating the effect on sigma values
+            
+            # Compute distilled points
+            student_points = []
+            
+            # For each step in the student model
+            for i in range(0, steps, 2):
+                if i + 1 < steps:
+                    # Progressive distillation tends to merge consecutive steps
+                    # Weighted average of consecutive teacher steps
+                    i_alpha = distillation_alpha + (1 - distillation_alpha) * (r / distillation_rounds)
+                    merged_sigma = teacher_schedule[i] * i_alpha + teacher_schedule[i+1] * (1 - i_alpha)
+                    student_points.append(merged_sigma.item())
+                else:
+                    # Handle odd number of steps
+                    student_points.append(teacher_schedule[i].item())
+            
+            # Interpolate student back to full step count
+            student_schedule = torch.tensor(student_points, device=device)
+            student_full = torch.nn.functional.interpolate(
+                student_schedule.unsqueeze(0).unsqueeze(0), 
+                size=steps, 
+                mode='linear'
+            ).squeeze()
+            
+            # Update current schedule with student
+            # Each round, the student has more influence
+            round_alpha = 0.6 ** (r + 1)  # Exponential decay of teacher influence
+            current_schedule = teacher_schedule * round_alpha + student_full * (1 - round_alpha)
+            
+            # Apply knowledge distillation adjustments
+            # Distillation tends to make schedules more efficient
+            # Lower values in early steps, higher in late steps
+            t_adj = (1 - t) ** (1.1 + 0.1 * r)  # Progressively more aggressive adjustment
+            adjustment = 0.1 * (r + 1) / distillation_rounds  # Increased effect with rounds
+            
+            current_schedule = current_schedule * (1 - adjustment * t_adj)
+            
+            # Ensure endpoints remain fixed
+            current_schedule[0] = start_value
+            current_schedule[-1] = end_value
+        
+        # Normalize output if requested
+        if normalize_output:
+            current_schedule = (current_schedule - current_schedule.min()) / (current_schedule.max() - current_schedule.min()) * (start_value - end_value) + end_value
+            current_schedule[0] = start_value
+            current_schedule[-1] = end_value
+        
+        # Add padding zero at the end if requested
+        if pad_end:
+            current_schedule = torch.cat([current_schedule, torch.tensor([0.0], device=device, dtype=current_schedule.dtype)])
+            
+        return (current_schedule,)
+
+
+# Quantum-inspired approaches
+
+class sigmas_schrodinger_bridge:
+    def __init__(self):
+        pass
+    
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "steps": ("INT", {"default": 30, "min": 5, "max": 100, "step": 1}),
+                "start_value": ("FLOAT", {"default": 10.0, "min": 0.1, "max": 50.0, "step": 0.1}),
+                "end_value": ("FLOAT", {"default": 0.01, "min": 0.0, "max": 10.0, "step": 0.01}),
+                "bridge_iterations": ("INT", {"default": 3, "min": 1, "max": 10, "step": 1}),
+                "convergence_rate": ("FLOAT", {"default": 0.7, "min": 0.1, "max": 0.9, "step": 0.01}),
+                "pad_end": ("BOOLEAN", {"default": True}),
+                "normalize_output": ("BOOLEAN", {"default": False})
+            }
+        }
+
+    FUNCTION = "main"
+    RETURN_TYPES = ("SIGMAS",)
+    CATEGORY = "RES4LYF/sigmas"
+    
+    def main(self, steps, start_value, end_value, bridge_iterations, convergence_rate, pad_end, normalize_output):
+        device = "cuda"
+        # Initialize with linear schedule
+        t = torch.linspace(0, 1, steps, device=device)
+        forward_schedule = start_value * (1 - t) + end_value * t
+        backward_schedule = torch.flip(forward_schedule, [0])
+        
+        # Normalize backward schedule
+        backward_schedule = start_value * (backward_schedule - backward_schedule.min()) / (backward_schedule.max() - backward_schedule.min())
+        
+        # Iteratively approximate Schrödinger bridge
+        for _ in range(bridge_iterations):
+            # Forward iteration of Schrödinger bridge
+            forward_drift = -torch.log(forward_schedule[1:] / forward_schedule[:-1]) / (t[1:] - t[:-1])
+            forward_drift = torch.cat([forward_drift[:1], forward_drift])  # Pad first element
+            
+            # Backward iteration
+            backward_drift = torch.log(backward_schedule[1:] / backward_schedule[:-1]) / (t[1:] - t[:-1])
+            backward_drift = torch.cat([backward_drift, backward_drift[-1:]])  # Pad last element
+            
+            # Average drifts (Schrödinger bridge principle)
+            # The true optimal bridge is where forward and backward processes match
+            avg_drift = 0.5 * (forward_drift - backward_drift)
+            
+            # Update schedules
+            new_forward = torch.zeros_like(forward_schedule)
+            new_forward[0] = start_value
+            
+            for i in range(1, steps):
+                # Integrate the average drift
+                dt = t[i] - t[i-1]
+                new_forward[i] = new_forward[i-1] * torch.exp(-avg_drift[i-1] * dt)
+            
+            # Update with convergence rate
+            forward_schedule = (1 - convergence_rate) * forward_schedule + convergence_rate * new_forward
+            
+            # Normalize to maintain endpoints
+            forward_schedule = (forward_schedule - forward_schedule[-1]) / (forward_schedule[0] - forward_schedule[-1])
+            forward_schedule = forward_schedule * (start_value - end_value) + end_value
+            
+            # Update backward schedule
+            backward_schedule = torch.flip(forward_schedule, [0])
+        
+        # Final refinement: ensure monotonicity
+        prev = forward_schedule[0]
+        for i in range(1, steps):
+            forward_schedule[i] = torch.minimum(prev, forward_schedule[i])
+            prev = forward_schedule[i]
+        
+        # Normalize output if requested
+        if normalize_output:
+            forward_schedule = (forward_schedule - forward_schedule.min()) / (forward_schedule.max() - forward_schedule.min()) * (start_value - end_value) + end_value
+            forward_schedule[0] = start_value
+            forward_schedule[-1] = end_value
+        
+        # Add padding zero at the end if requested
+        if pad_end:
+            forward_schedule = torch.cat([forward_schedule, torch.tensor([0.0], device=device, dtype=forward_schedule.dtype)])
+            
+        return (forward_schedule,)
+
+
+class sigmas_wave_packet:
+    def __init__(self):
+        pass
+    
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "steps": ("INT", {"default": 30, "min": 5, "max": 100, "step": 1}),
+                "start_value": ("FLOAT", {"default": 10.0, "min": 0.1, "max": 50.0, "step": 0.1}),
+                "end_value": ("FLOAT", {"default": 0.01, "min": 0.0, "max": 10.0, "step": 0.01}),
+                "packet_shape": (["gaussian", "hermite", "laguerre", "coherent"], {"default": "gaussian"}),
+                "quantum_parameter": ("FLOAT", {"default": 0.5, "min": 0.1, "max": 2.0, "step": 0.01}),
+                "pad_end": ("BOOLEAN", {"default": True}),
+                "normalize_output": ("BOOLEAN", {"default": False})
+            }
+        }
+
+    FUNCTION = "main"
+    RETURN_TYPES = ("SIGMAS",)
+    CATEGORY = "RES4LYF/sigmas"
+    
+    def main(self, steps, start_value, end_value, packet_shape, quantum_parameter, pad_end, normalize_output):
+        device = "cuda"
+        # Time evolution parameter
+        t = torch.linspace(0, 1, steps, device=device)
+        
+        if packet_shape == "gaussian":
+            # Gaussian wave packet evolution
+            # Width evolves according to quantum spreading
+            width = torch.sqrt(1 + (quantum_parameter * t)**2)
+            
+            # Position evolves linearly
+            position = 1 - t  # From 1 to 0
+            
+            # Quantum Gaussian wave packet probability density
+            # |Ψ(x,t)|^2 = (1/sqrt(2π*width^2)) * exp(-(x-position)^2/(2*width^2))
+            # We evaluate at x=0 (fixed reference point) as t evolves
+            packet_density = torch.exp(-(position**2) / (2 * width**2)) / (torch.sqrt(2 * torch.tensor(math.pi, device=device)) * width)
+            
+            # Normalize
+            packet_density = packet_density / packet_density.max()
+            
+            # Convert to sigma values (wave packet controls noise schedule)
+            sigma_values = start_value * packet_density + end_value * (1 - packet_density)
+            
+        elif packet_shape == "hermite":
+            # Hermite-Gaussian wave packet (quantum harmonic oscillator eigenstate)
+            # The n=1 excited state has a node at the center
+            
+            # Position evolves according to harmonic oscillator
+            position = torch.cos(quantum_parameter * torch.tensor(math.pi, device=device) * t)
+            
+            # First Hermite polynomial: H_1(x) = 2x
+            hermite = 2 * position
+            
+            # Wavefunction: Ψ(x,t) = H_1(x) * exp(-x^2/2)
+            # Probability: |Ψ|^2
+            packet_density = (hermite**2) * torch.exp(-position**2)
+            
+            # Normalize
+            packet_density = packet_density / packet_density.max()
+            
+            # Convert to sigma values
+            sigma_values = start_value * packet_density + end_value * (1 - packet_density)
+            
+        elif packet_shape == "laguerre":
+            # Laguerre-Gaussian beam profile
+            # Used in quantum optics for orbital angular momentum states
+            
+            # Radial parameter
+            radius = 1 - t  # From 1 to 0
+            
+            # Laguerre polynomial L^0_1(x) = 1 - x
+            laguerre = 1 - (quantum_parameter * radius**2)
+            
+            # Probability density: |Ψ|^2 = L^2 * exp(-r^2)
+            packet_density = (laguerre**2) * torch.exp(-radius**2)
+            
+            # Normalize
+            packet_density = packet_density / packet_density.max()
+            
+            # Convert to sigma values
+            sigma_values = start_value * packet_density + end_value * (1 - packet_density)
+            
+        elif packet_shape == "coherent":
+            # Coherent state (quantum harmonic oscillator with classical-like behavior)
+            # Position oscillates while maintaining minimum uncertainty
+            
+            # Time-evolving position
+            phase = 2 * torch.tensor(math.pi, device=device) * t
+            re_alpha = quantum_parameter * torch.cos(phase)
+            im_alpha = quantum_parameter * torch.sin(phase)
+            
+            # Coherent state probability at origin: |⟨0|α⟩|^2 = exp(-|α|^2)
+            alpha_squared = re_alpha**2 + im_alpha**2
+            packet_density = torch.exp(-alpha_squared)
+            
+            # Normalize and invert (lower probability = higher sigma)
+            packet_density = 1 - packet_density / packet_density.min()
+            packet_density = packet_density / packet_density.max()
+            
+            # Convert to sigma values
+            sigma_values = start_value * packet_density + end_value * (1 - packet_density)
+        
+        # Ensure endpoints are exactly as specified
+        sigma_values[0] = start_value
+        sigma_values[-1] = end_value
+        
+        # Ensure monotonicity
+        for i in range(1, steps):
+            sigma_values[i] = torch.minimum(sigma_values[i-1], sigma_values[i])
+        
+        # Normalize output if requested
+        if normalize_output:
+            sigma_values = (sigma_values - sigma_values.min()) / (sigma_values.max() - sigma_values.min()) * (start_value - end_value) + end_value
+            sigma_values[0] = start_value
+            sigma_values[-1] = end_value
+        
+        # Add padding zero at the end if requested
+        if pad_end:
+            sigma_values = torch.cat([sigma_values, torch.tensor([0.0], device=device, dtype=sigma_values.dtype)])
+            
+        return (sigma_values,)
+
+
+class sigmas_quantum_annealing:
+    def __init__(self):
+        pass
+    
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "steps": ("INT", {"default": 30, "min": 5, "max": 100, "step": 1}),
+                "start_value": ("FLOAT", {"default": 10.0, "min": 0.1, "max": 50.0, "step": 0.1}),
+                "end_value": ("FLOAT", {"default": 0.01, "min": 0.0, "max": 10.0, "step": 0.01}),
+                "annealing_profile": (["linear", "quadratic", "exponential", "adiabatic"], {"default": "adiabatic"}),
+                "temperature": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "pad_end": ("BOOLEAN", {"default": True}),
+                "normalize_output": ("BOOLEAN", {"default": False})
+            }
+        }
+
+    FUNCTION = "main"
+    RETURN_TYPES = ("SIGMAS",)
+    CATEGORY = "RES4LYF/sigmas"
+    
+    def main(self, steps, start_value, end_value, annealing_profile, temperature, pad_end, normalize_output):
+        device = "cuda"
+        # Create normalized time
+        s = torch.linspace(0, 1, steps, device=device)
+        
+        # Initialize result
+        sigma_values = torch.zeros(steps, device=device)
+        
+        if annealing_profile == "linear":
+            # Linear annealing schedule
+            annealing_factor = s
+            
+        elif annealing_profile == "quadratic":
+            # Quadratic annealing (faster at the end)
+            annealing_factor = s**2
+            
+        elif annealing_profile == "exponential":
+            # Exponential annealing (rapid cooling)
+            decay_rate = torch.tensor(5.0, device=device)  # Controls decay speed
+            annealing_factor = (1 - torch.exp(-decay_rate * s)) / (1 - torch.exp(-decay_rate))
+            
+        elif annealing_profile == "adiabatic":
+            # Quantum adiabatic annealing
+            # Rate proportional to gap^2, which typically narrows near phase transition
+            
+            # Simulate phase transition in the middle
+            gap = 0.1 + 0.9 * (1 - torch.exp(-(s - 0.5)**2 / (2 * 0.15**2)))
+            
+            # Calculate progress according to adiabatic principle
+            # ds/dt ∝ gap^2 (can go faster when energy gap is large)
+            velocity = gap**2
+            
+            # Integrate velocity to get position
+            annealing_factor = torch.cumsum(velocity, dim=0)
+            annealing_factor = annealing_factor / annealing_factor[-1]  # Normalize to [0,1]
+            
+        # Calculate transverse field strength A(s) and problem Hamiltonian strength B(s)
+        # In quantum annealing: H(s) = (1-s)·A(s)·H_transverse + s·B(s)·H_problem
+        A_s = 1 - annealing_factor
+        B_s = annealing_factor
+        
+        # Quantum effect: add thermal fluctuations
+        if temperature > 0:
+            # Thermal fluctuations are stronger at high temperature and high transverse field
+            noise_scale = temperature * A_s
+            thermal_noise = noise_scale * torch.randn(steps, device=device)
+            
+            # Add noise but preserve monotonicity
+            A_s = A_s + thermal_noise
+            A_s = torch.clamp(A_s, min=0, max=1)
+            
+            # Ensure monotonicity of A_s (decreasing)
+            for i in range(1, steps):
+                A_s[i] = torch.minimum(A_s[i], A_s[i-1])
+            
+            # Recalculate B_s
+            B_s = 1 - A_s
+        
+        # Convert to sigma values
+        # Higher transverse field (A_s) = higher sigma (more noise)
+        # Higher problem Hamiltonian (B_s) = lower sigma (less noise)
+        sigma_values = start_value * A_s + end_value * B_s
+        
+        # Ensure endpoints match exactly
+        sigma_values[0] = start_value
+        sigma_values[-1] = end_value
+        
+        # Normalize output if requested
+        if normalize_output:
+            sigma_values = (sigma_values - sigma_values.min()) / (sigma_values.max() - sigma_values.min()) * (start_value - end_value) + end_value
+            sigma_values[0] = start_value
+            sigma_values[-1] = end_value
+        
+        # Add padding zero at the end if requested
+        if pad_end:
+            sigma_values = torch.cat([sigma_values, torch.tensor([0.0], device=device, dtype=sigma_values.dtype)])
+            
+        return (sigma_values,)
+
+
+# Neural and adaptive methods
+
+class sigmas_learned_path:
+    def __init__(self):
+        pass
+    
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "steps": ("INT", {"default": 30, "min": 5, "max": 100, "step": 1}),
+                "start_value": ("FLOAT", {"default": 10.0, "min": 0.1, "max": 50.0, "step": 0.1}),
+                "end_value": ("FLOAT", {"default": 0.01, "min": 0.0, "max": 10.0, "step": 0.01}),
+                "network_type": (["cosine", "edm", "improved", "karras", "custom"], {"default": "improved"}),
+                "custom_param": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "pad_end": ("BOOLEAN", {"default": True}),
+                "normalize_output": ("BOOLEAN", {"default": False})
+            }
+        }
+
+    FUNCTION = "main"
+    RETURN_TYPES = ("SIGMAS",)
+    CATEGORY = "RES4LYF/sigmas"
+    
+    def main(self, steps, start_value, end_value, network_type, custom_param, pad_end, normalize_output):
+        device = "cuda"
+        # Time steps
+        t = torch.linspace(0, 1, steps, device=device)
+        
+        if network_type == "cosine":
+            # Cosine-based learned schedule (DDPM++, improved DDPM)
+            # One of the most widely used learned schedules
+            sigma_values = start_value * torch.cos(t * torch.pi/2) + end_value * (1 - torch.cos(t * torch.pi/2))
+            
+        elif network_type == "edm":
+            # EDM (Elucidating Diffusion Models) learned schedule
+            # log-normal distribution based
+            sigma_max = start_value
+            sigma_min = end_value
+            rho = 7  # EDM paper used 7
+            
+            # EDM formulation (reparameterized for easier tuning)
+            sigma_values = (sigma_max ** (1/rho) + t * (sigma_min ** (1/rho) - sigma_max ** (1/rho))) ** rho
+            
+        elif network_type == "improved":
+            # Improved noise schedule - learned from DDPM training
+            # S-shaped with slower decay in critical mid-range
+            # Based on insights from training dynamics
+            
+            # Create sigmoid-like S-curve with controlled slope
+            beta1 = torch.tensor(1e-4, device=device)
+            beta2 = torch.tensor(0.02, device=device)
+            
+            # Betas schedule increasing from beta1 to beta2
+            betas = torch.linspace(beta1, beta2, steps, device=device)
+            
+            # Apply learned corrections to focus on mid-range
+            # Slower change in critical noise region
+            modulation = 1 - torch.exp(-(t - 0.5)**2 / 0.1)
+            betas = betas * modulation
+            
+            # Convert betas to sigmas
+            alphas = 1 - betas
+            alphas_cumprod = torch.cumprod(alphas, dim=0)
+            sigmas_squared = (1 - alphas_cumprod) / alphas_cumprod
+            sigma_values = torch.sqrt(sigmas_squared)
+            
+            # Scale to match desired range
+            sigma_values = sigma_values / sigma_values[0] * start_value
+            sigma_values[-1] = end_value  # Ensure exact end value
+            
+        elif network_type == "karras":
+            # Karras et al. learned schedule
+            # Optimized for specific step count ranges
+            # Parameterized to match findings from extensive experimentation
+            
+            # Convert log-sigmas
+            log_sigma_max = torch.log(torch.tensor(start_value, device=device))
+            log_sigma_min = torch.log(torch.tensor(end_value, device=device))
+            
+            # Karras formula with learned parameters
+            rho = 7  # Karras paper explores different values
+            log_sigmas = log_sigma_min + (log_sigma_max - log_sigma_min) * (1 - t) ** rho
+            sigma_values = torch.exp(log_sigmas)
+            
+        elif network_type == "custom":
+            # Custom learned schedule based on research findings
+            # Mixed schedule that adapts based on the custom parameter
+            
+            # Basic schedules
+            linear = start_value * (1 - t) + end_value * t
+            
+            # Log-normal distribution
+            log_start = torch.log(torch.tensor(start_value, device=device))
+            log_end = torch.log(torch.tensor(end_value, device=device))
+            lognormal = torch.exp(log_start * (1 - t) + log_end * t)
+            
+            # Cosine schedule
+            cosine = start_value * torch.cos(t * torch.pi/2) + end_value * (1 - torch.cos(t * torch.pi/2))
+            
+            # Custom blend based on findings
+            # Parameter controls balance between different schedules
+            alpha = custom_param
+            
+            # When alpha is low, favor cosine early and lognormal late
+            # When alpha is high, favor linear early and cosine late
+            mix1 = (1 - t) * ((1 - alpha) * cosine + alpha * linear)
+            mix2 = t * ((1 - alpha) * lognormal + alpha * cosine)
+            
+            sigma_values = mix1 + mix2
+        
+        # Ensure endpoints match exactly
+        sigma_values[0] = start_value
+        sigma_values[-1] = end_value
+        
+        # Normalize output if requested
+        if normalize_output:
+            sigma_values = (sigma_values - sigma_values.min()) / (sigma_values.max() - sigma_values.min()) * (start_value - end_value) + end_value
+            sigma_values[0] = start_value
+            sigma_values[-1] = end_value
+        
+        # Add padding zero at the end if requested
+        if pad_end:
+            sigma_values = torch.cat([sigma_values, torch.tensor([0.0], device=device, dtype=sigma_values.dtype)])
+            
+        return (sigma_values,)
+
+
+class sigmas_transformer_guided:
+    def __init__(self):
+        pass
+    
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "steps": ("INT", {"default": 30, "min": 5, "max": 100, "step": 1}),
+                "start_value": ("FLOAT", {"default": 10.0, "min": 0.1, "max": 50.0, "step": 0.1}),
+                "end_value": ("FLOAT", {"default": 0.01, "min": 0.0, "max": 10.0, "step": 0.01}),
+                "attention_heads": ("INT", {"default": 4, "min": 1, "max": 8, "step": 1}),
+                "attention_strength": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "pad_end": ("BOOLEAN", {"default": True}),
+                "normalize_output": ("BOOLEAN", {"default": False})
+            }
+        }
+
+    FUNCTION = "main"
+    RETURN_TYPES = ("SIGMAS",)
+    CATEGORY = "RES4LYF/sigmas"
+    
+    def main(self, steps, start_value, end_value, attention_heads, attention_strength, pad_end, normalize_output):
+        device = "cuda"
+        # Start with a base schedule
+        t = torch.linspace(0, 1, steps, device=device)
+        base_schedule = start_value * (1 - t) + end_value * t
+        
+        # Simulate transformer attention mechanism
+        
+        # 1. Create positional encoding
+        position = torch.arange(0, steps, device=device).unsqueeze(1).float()
+        div_term = torch.exp(torch.arange(0, attention_heads*2, 2, device=device) * (-math.log(10000.0) / (attention_heads*2)))
+        pos_enc = torch.zeros(steps, attention_heads*2, device=device)
+        pos_enc[:, 0::2] = torch.sin(position * div_term)
+        pos_enc[:, 1::2] = torch.cos(position * div_term)
+        
+        # 2. Create value embedding (base schedule normalized to [-1,1])
+        values = 2 * (base_schedule - base_schedule.min()) / (base_schedule.max() - base_schedule.min()) - 1
+        values = values.unsqueeze(1).repeat(1, attention_heads)  # [steps, heads]
+        
+        # 3. Compute attention scores (simplified self-attention)
+        # Dot product of positional encodings
+        pos_enc_reshaped = pos_enc.view(steps, attention_heads, 2)
+        query = pos_enc_reshaped  # [steps, heads, 2]
+        key = pos_enc_reshaped    # [steps, heads, 2]
+        
+        # Compute attention scores
+        attn_scores = torch.bmm(
+            query.transpose(0, 1),           # [heads, steps, 2]
+            key.transpose(0, 1).transpose(1, 2)  # [heads, 2, steps]
+        )  # [heads, steps, steps]
+        
+        # Scale scores
+        attn_scores = attn_scores / math.sqrt(2)  # Scaling factor
+        
+        # Apply softmax for each position
+        attn_probs = torch.softmax(attn_scores, dim=2)  # [heads, steps, steps]
+        
+        # 4. Apply attention to values
+        weighted_values = torch.bmm(
+            attn_probs,                       # [heads, steps, steps]
+            values.transpose(0, 1)            # [heads, steps]
+        )  # [heads, steps]
+        
+        # 5. Combine attention outputs across heads
+        attn_output = weighted_values.mean(dim=0)  # [steps]
+        
+        # 6. Convert back to sigma range
+        attn_output = (attn_output + 1) / 2  # Back to [0,1]
+        attn_schedule = start_value * (1 - attn_output) + end_value * attn_output
+        
+        # 7. Blend with base schedule according to attention strength
+        sigma_values = (1 - attention_strength) * base_schedule + attention_strength * attn_schedule
+        
+        # Ensure monotonicity
+        for i in range(1, steps):
+            sigma_values[i] = torch.minimum(sigma_values[i-1], sigma_values[i])
+            
+        # Ensure endpoints match exactly
+        sigma_values[0] = start_value
+        sigma_values[-1] = end_value
+        
+        # Normalize output if requested
+        if normalize_output:
+            sigma_values = (sigma_values - sigma_values.min()) / (sigma_values.max() - sigma_values.min()) * (start_value - end_value) + end_value
+            sigma_values[0] = start_value
+            sigma_values[-1] = end_value
+        
+        # Add padding zero at the end if requested
+        if pad_end:
+            sigma_values = torch.cat([sigma_values, torch.tensor([0.0], device=device, dtype=sigma_values.dtype)])
+            
+        return (sigma_values,)
+
+
+class sigmas_meta_learned:
+    def __init__(self):
+        pass
+    
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "steps": ("INT", {"default": 30, "min": 5, "max": 100, "step": 1}),
+                "start_value": ("FLOAT", {"default": 10.0, "min": 0.1, "max": 50.0, "step": 0.1}),
+                "end_value": ("FLOAT", {"default": 0.01, "min": 0.0, "max": 10.0, "step": 0.01}),
+                "style": (["general", "photography", "illustration", "faces", "landscapes"], {"default": "general"}),
+                "adaptation_strength": ("FLOAT", {"default": 0.7, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "pad_end": ("BOOLEAN", {"default": True}),
+                "normalize_output": ("BOOLEAN", {"default": False})
+            }
+        }
+
+    FUNCTION = "main"
+    RETURN_TYPES = ("SIGMAS",)
+    CATEGORY = "RES4LYF/sigmas"
+    
+    def main(self, steps, start_value, end_value, style, adaptation_strength, pad_end, normalize_output):
+        device = "cuda"
+        # Initialize result
+        t = torch.linspace(0, 1, steps, device=device)
+        
+        # Base learned schedule
+        # Improved noise schedule from large-scale training
+        base_powers = torch.linspace(1, 3, steps, device=device)
+        base_decay = torch.pow(1 - t, base_powers)
+        base_schedule = start_value * base_decay + end_value * (1 - base_decay)
+        
+        # Meta-learned adjustments for different domains
+        if style == "general":
+            # Balanced schedule good for general content
+            # This is our default schedule
+            adjustment = torch.zeros_like(t)
+            
+        elif style == "photography":
+            # Photographic content needs more steps in the mid-noise region
+            # where texture and detail are refined
+            mid_boost = torch.exp(-(t - 0.3)**2 / 0.1) * 0.15
+            adjustment = -mid_boost  # Negative means more noise (slower reduction)
+            
+        elif style == "illustration":
+            # Illustration benefits from slower noise reduction early
+            # to establish basic forms, then faster at the end
+            early_slow = torch.exp(-(t - 0.15)**2 / 0.1) * 0.2
+            adjustment = -early_slow
+            
+        elif style == "faces":
+            # Faces are sensitive to noise schedule in middle-to-late steps
+            # where facial features are refined
+            face_features = torch.exp(-(t - 0.7)**2 / 0.1) * 0.1
+            adjustment = -face_features
+            
+        elif style == "landscapes":
+            # Landscapes benefit from distinct noise treatment at different scales
+            # Early for large structures, mid for medium details, late for fine texture
+            large_structures = torch.exp(-(t - 0.2)**2 / 0.05) * 0.15
+            medium_details = torch.exp(-(t - 0.5)**2 / 0.05) * 0.1
+            fine_texture = torch.exp(-(t - 0.8)**2 / 0.05) * 0.05
+            adjustment = -(large_structures + medium_details + fine_texture)
+        
+        # Apply style-specific adjustment modulated by adaptation strength
+        adaptive_adjustment = adjustment * adaptation_strength
+        
+        # Compute log-domain adjustment for better scaling
+        log_base = torch.log(base_schedule)
+        log_adjusted = log_base + adaptive_adjustment
+        adjusted_schedule = torch.exp(log_adjusted)
+        
+        # Ensure monotonicity
+        for i in range(1, steps):
+            adjusted_schedule[i] = torch.minimum(adjusted_schedule[i-1], adjusted_schedule[i])
+            
+        # Ensure endpoints match exactly
+        adjusted_schedule[0] = start_value
+        adjusted_schedule[-1] = end_value
+        
+        # Normalize output if requested
+        if normalize_output:
+            adjusted_schedule = (adjusted_schedule - adjusted_schedule.min()) / (adjusted_schedule.max() - adjusted_schedule.min()) * (start_value - end_value) + end_value
+            adjusted_schedule[0] = start_value
+            adjusted_schedule[-1] = end_value
+        
+        # Add padding zero at the end if requested
+        if pad_end:
+            adjusted_schedule = torch.cat([adjusted_schedule, torch.tensor([0.0], device=device, dtype=adjusted_schedule.dtype)])
+            
+        return (adjusted_schedule,)
+
+
+# KL-Optimal Scheduler 
+
+class sigmas_kl_optimal:
+    def __init__(self):
+        pass
+    
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "steps": ("INT", {"default": 30, "min": 5, "max": 1000, "step": 1}),
+                "start_value": ("FLOAT", {"default": 10.0, "min": 0.1, "max": 50.0, "step": 0.1}),
+                "end_value": ("FLOAT", {"default": 0.01, "min": 0.0, "max": 10.0, "step": 0.01}),
+                "schedule_type": (["standard", "mutual_information", "elbo_optimal"], {"default": "elbo_optimal"}),
+                "beta": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 10.0, "step": 0.01}),
+                "pad_end": ("BOOLEAN", {"default": True}),
+                "normalize_output": ("BOOLEAN", {"default": False})
+            }
+        }
+
+    FUNCTION = "main"
+    RETURN_TYPES = ("SIGMAS",)
+    CATEGORY = "RES4LYF/sigmas"
+    
+    def main(self, steps, start_value, end_value, schedule_type, beta, pad_end, normalize_output):
+        device = "cuda"
+        # Create empty array for result
+        result = torch.zeros(steps, device=device, dtype=torch.float32)
+        
+        if schedule_type == "standard":
+            # Standard KL-optimal schedule based on diffusion variance
+            # This schedule concentrates more steps where the KL divergence changes quickly
+            t = torch.linspace(0, 1, steps, device=device)
+            exp_t = torch.exp(-torch.tensor(beta, device=device) * t)
+            
+            # Variance schedule that's optimized for ELBO
+            variance = start_value * exp_t + end_value * (1 - exp_t)
+            
+            # Convert variance to sigma (standard deviation)
+            result = torch.sqrt(variance)
+            
+        elif schedule_type == "mutual_information":
+            # Schedule optimized for mutual information across diffusion steps
+            # This tends to add more steps at the beginning and end of diffusion
+            alphas = torch.linspace(0, 1, steps, device=device)
+            
+            # Create informational-theoretic optimal schedule
+            # Formula derived from optimizing mutual information between adjacent steps
+            result[0] = start_value
+            for i in range(1, steps):
+                t = i / (steps - 1)
+                # Information-theoretic rate according to mutual information objective
+                mi_rate = torch.sqrt(torch.tensor(beta, device=device) * (1 - torch.exp(-2 * beta * t)))
+                result[i] = result[i-1] * torch.exp(-mi_rate / steps)
+            
+            # Rescale to match desired range
+            result = (result - result[-1]) / (result[0] - result[-1]) * (start_value - end_value) + end_value
+            
+        elif schedule_type == "elbo_optimal":
+            # Optimal schedule for ELBO (Evidence Lower Bound)
+            # This is the most theoretically justified KL-optimal schedule
+            
+            # Create time points
+            t = torch.linspace(0, 1, steps, device=device)
+            
+            # Discretized KL optimal schedule based on squared cosine
+            # This approximates the true KL-optimal continuous schedule
+            # Formula based on improved DDPM paper and follow-up work
+            alpha_t = torch.cos((t + beta) / (1 + beta) * torch.tensor(math.pi/2, device=device)) ** 2
+            alpha_t = alpha_t / alpha_t[0]  # Normalize
+            
+            # Convert to sigma
+            sigma_t = torch.sqrt((1 - alpha_t) / alpha_t)
+            
+            # Scale to desired range
+            result = sigma_t * start_value
+            result[-1] = end_value  # Ensure exact end value
+        
+        # Normalize output if requested
+        if normalize_output:
+            result = (result - result.min()) / (result.max() - result.min()) * (start_value - end_value) + end_value
+            result[0] = start_value
+            result[-1] = end_value
+        
+        # Add padding zero at the end if requested
+        if pad_end:
+            result = torch.cat([result, torch.tensor([0.0], device=device, dtype=result.dtype)])
+            
+        return (result,)
+
+        
+
+
+
+
